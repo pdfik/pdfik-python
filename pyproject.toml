@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdfik"
+version = "0.2.2"
+description = "Official Python SDK for the PDFik PDF generation API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "PDFik", email = "support@pdfik.net"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "tenacity>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://pdfik.net"
+Documentation = "https://docs.pdfik.net"
+Repository = "https://github.com/pdfik/pdfik-python"
+Issues = "https://github.com/pdfik/pdfik-python/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "respx>=0.20.0",
+    "mypy>=1.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pdfik"]
