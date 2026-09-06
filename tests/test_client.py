@@ -8,7 +8,11 @@ from pdfik import (
     PdfOptions,
     RenderOptions,
     MarginOptions,
+    EInvoiceOptions,
+    EInvoiceProfile,
 )
+
+SAMPLE_CII_XML = '<?xml version="1.0" encoding="UTF-8"?><rsm:CrossIndustryInvoice/>'
 
 # Sync Tests
 
@@ -63,6 +67,116 @@ def test_html_to_pdf_request():
     body = json.loads(request.read())
     assert body["html"] == "<h1>Hello</h1>"
     assert body["options"]["landscape"] is True
+
+
+@respx.mock
+def test_einvoice_to_pdf_request():
+    route = respx.post("https://api.pdfik.net/einvoice-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-einv", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.einvoice_to_pdf(
+        SAMPLE_CII_XML,
+        template_id="tpl-1",
+        webhook_url="https://webhook.com",
+        idempotency_key="idem-1",
+    )
+
+    assert res.job_id == "job-einv"
+    assert res.status == "queued"
+    assert route.called
+    request = route.calls[0].request
+    assert request.headers["X-API-Key"] == "sk_test_123"
+    assert request.headers["Idempotency-Key"] == "idem-1"
+
+    import json
+    body = json.loads(request.read())
+    assert body["xml"] == SAMPLE_CII_XML
+    assert body["profile"] == "en16931"  # default
+    assert body["template_id"] == "tpl-1"
+    assert body["webhook_url"] == "https://webhook.com"
+    assert "template" not in body
+    assert "test" not in body
+
+
+@respx.mock
+def test_einvoice_to_pdf_inline_template_and_test_mode():
+    route = respx.post("https://api.pdfik.net/einvoice-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-einv-2", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.einvoice_to_pdf(
+        SAMPLE_CII_XML,
+        profile=EInvoiceProfile.EXTENDED,
+        template={"blocks": [{"type": "header"}]},
+        test=True,
+    )
+
+    assert res.job_id == "job-einv-2"
+    assert route.called
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body["profile"] == "extended"
+    assert body["template"] == {"blocks": [{"type": "header"}]}
+    assert body["test"] is True
+    assert "template_id" not in body
+
+
+@respx.mock
+def test_url_to_pdf_with_einvoice_option():
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-a", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    client.url_to_pdf(
+        "https://example.com/invoice/42",
+        einvoice=EInvoiceOptions(xml=SAMPLE_CII_XML, profile="basic"),
+    )
+
+    assert route.called
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body["einvoice"]["format"] == "factur-x"
+    assert body["einvoice"]["profile"] == "basic"
+    assert body["einvoice"]["xml"] == SAMPLE_CII_XML
+
+
+@respx.mock
+def test_html_to_pdf_with_einvoice_option():
+    route = respx.post("https://api.pdfik.net/html-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-b", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    client.html_to_pdf(
+        "<h1>Invoice 42</h1>",
+        einvoice=EInvoiceOptions(xml=SAMPLE_CII_XML),
+    )
+
+    assert route.called
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body["einvoice"]["format"] == "factur-x"
+    assert body["einvoice"]["profile"] == "en16931"  # default
+    assert body["einvoice"]["xml"] == SAMPLE_CII_XML
 
 
 @respx.mock
@@ -163,6 +277,29 @@ async def test_async_url_to_pdf():
         assert res.job_id == "job-async"
         assert res.status == "queued"
         assert route.called
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_einvoice_to_pdf():
+    route = respx.post("https://api.pdfik.net/einvoice-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-einv-async", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        res = await client.einvoice_to_pdf(SAMPLE_CII_XML, profile="basicwl")
+
+        assert res.job_id == "job-einv-async"
+        assert res.status == "queued"
+        assert route.called
+
+        import json
+        body = json.loads(route.calls[0].request.read())
+        assert body["xml"] == SAMPLE_CII_XML
+        assert body["profile"] == "basicwl"
 
 
 @pytest.mark.asyncio

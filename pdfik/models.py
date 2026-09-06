@@ -5,11 +5,17 @@ from typing import Optional, Any, Dict, Type, TypeVar, get_type_hints
 T = TypeVar('T')
 
 class PaperFormat(str, Enum):
-    A4 = "A4"
+    A0 = "A0"
+    A1 = "A1"
+    A2 = "A2"
     A3 = "A3"
+    A4 = "A4"
+    A5 = "A5"
+    A6 = "A6"
     LETTER = "Letter"
     LEGAL = "Legal"
     TABLOID = "Tabloid"
+    LEDGER = "Ledger"
 
 class WaitUntilEvent(str, Enum):
     LOAD = "load"
@@ -23,6 +29,16 @@ class JobStatus(str, Enum):
     UPLOADING = "uploading"
     DONE = "done"
     FAILED = "failed"
+
+class EInvoiceProfile(str, Enum):
+    # 'minimum' and 'basicwl' carry accompanying data only and are NOT a
+    # legally sufficient e-invoice; use basic/en16931/extended for a complete
+    # legal invoice.
+    MINIMUM = "minimum"
+    BASICWL = "basicwl"
+    BASIC = "basic"
+    EN16931 = "en16931"
+    EXTENDED = "extended"
 
 def _from_dict(cls: Type[T], data: Any) -> Any:
     if data is None:
@@ -122,6 +138,20 @@ class RenderOptions:
 class JobAuthOptions:
     type: str
     value: str
+
+@dataclass
+class EInvoiceOptions:
+    # Attach a Factur-X e-invoice to a url_to_pdf/html_to_pdf render: the
+    # rendered page becomes the human-readable half, the output is normalized
+    # to PDF/A-3 and the XML is embedded as factur-x.xml. Mutually exclusive
+    # with PdfOptions.user_password (PDF/A forbids encryption) and
+    # PdfOptions.compression (re-saving breaks the PDF/A attributes).
+    # UN/CEFACT Cross-Industry-Invoice XML (UTF-8, up to 1 MB), validated
+    # server-side against the official XSD of the declared profile
+    xml: str
+    profile: EInvoiceProfile = EInvoiceProfile.EN16931
+    # E-invoice container format; only "factur-x" is supported
+    format: str = "factur-x"
 
 @dataclass
 class JobCreatedResponse:

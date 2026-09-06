@@ -14,6 +14,8 @@ from .models import (
     PdfOptions,
     RenderOptions,
     JobAuthOptions,
+    EInvoiceOptions,
+    EInvoiceProfile,
     _to_dict
 )
 
@@ -55,7 +57,9 @@ class PdfikClient:
                 data = response.json()
                 if isinstance(data, dict):
                     message = data.get("detail", message)
-                    error_code = data.get("error_code")
+                    # pdf-api's RFC 7807 bodies carry the code in "error";
+                    # "error_code" is a fallback for any body that still uses it.
+                    error_code = data.get("error") or data.get("error_code")
             except Exception:
                 pass
             raise PdfikError(message, response.status_code, error_code, response_body)
@@ -70,10 +74,16 @@ class PdfikClient:
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
         auth: Optional[JobAuthOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
         """Submit a job that renders a public URL to a PDF.
+
+        Pass ``einvoice`` to embed a Factur-X CII XML into the rendered PDF:
+        the output is normalized to PDF/A-3 with the XML attached as
+        ``factur-x.xml``. Not combinable with ``options.user_password`` or
+        ``options.compression``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -90,6 +100,8 @@ class PdfikClient:
             body["render"] = _to_dict(render)
         if auth:
             body["auth"] = _to_dict(auth)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
         if test:
             body["test"] = True
 
@@ -104,10 +116,16 @@ class PdfikClient:
         webhook_url: Optional[str] = None,
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
         """Submit a job that renders raw HTML markup to a PDF.
+
+        Pass ``einvoice`` to embed a Factur-X CII XML into the rendered PDF:
+        the output is normalized to PDF/A-3 with the XML attached as
+        ``factur-x.xml``. Not combinable with ``options.user_password`` or
+        ``options.compression``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -122,11 +140,57 @@ class PdfikClient:
             body["options"] = _to_dict(options)
         if render:
             body["render"] = _to_dict(render)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
         if test:
             body["test"] = True
 
         extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         res = self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    def einvoice_to_pdf(
+        self,
+        xml: str,
+        *,
+        profile: EInvoiceProfile = EInvoiceProfile.EN16931,
+        template_id: Optional[str] = None,
+        template: Optional[dict] = None,
+        webhook_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a Factur-X e-invoice job: the UN/CEFACT CII ``xml`` is
+        validated against the official XSD of the declared ``profile``, a
+        human-readable invoice is built from a block template, rendered to
+        PDF/A-3 and the XML is embedded as ``factur-x.xml`` (Factur-X /
+        ZUGFeRD hybrid). Then poll/download via the normal job flow.
+
+        ``template_id`` (a template saved in the dashboard) and ``template``
+        (an inline block-template dict) are mutually exclusive; omit both to
+        use the account default template. Available on every plan; on Free
+        the output carries a PDFik.net watermark. Profiles ``minimum`` and
+        ``basicwl`` carry accompanying data only and are NOT a legally
+        sufficient e-invoice.
+
+        Set ``test=True`` to run the job in test mode: it goes through the full
+        pipeline (statuses, webhook, download) without real rendering, and the
+        download returns a sample PDF. Quotas are not debited — test jobs are
+        free and rate-limited instead (60/min, 2,000/day). Job status
+        and webhook payloads always carry ``test: true|false``.
+        """
+        body = {"xml": xml, "profile": _to_dict(profile)}
+        if template_id:
+            body["template_id"] = template_id
+        if template:
+            body["template"] = template
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
     def get_job(self, job_id: str) -> JobStatusResponse:
@@ -245,7 +309,9 @@ class AsyncPdfikClient:
                 data = response.json()
                 if isinstance(data, dict):
                     message = data.get("detail", message)
-                    error_code = data.get("error_code")
+                    # pdf-api's RFC 7807 bodies carry the code in "error";
+                    # "error_code" is a fallback for any body that still uses it.
+                    error_code = data.get("error") or data.get("error_code")
             except Exception:
                 pass
             raise PdfikError(message, response.status_code, error_code, response_body)
@@ -260,10 +326,16 @@ class AsyncPdfikClient:
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
         auth: Optional[JobAuthOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
         """Submit a job that renders a public URL to a PDF.
+
+        Pass ``einvoice`` to embed a Factur-X CII XML into the rendered PDF:
+        the output is normalized to PDF/A-3 with the XML attached as
+        ``factur-x.xml``. Not combinable with ``options.user_password`` or
+        ``options.compression``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -280,6 +352,8 @@ class AsyncPdfikClient:
             body["render"] = _to_dict(render)
         if auth:
             body["auth"] = _to_dict(auth)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
         if test:
             body["test"] = True
 
@@ -294,10 +368,16 @@ class AsyncPdfikClient:
         webhook_url: Optional[str] = None,
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
         """Submit a job that renders raw HTML markup to a PDF.
+
+        Pass ``einvoice`` to embed a Factur-X CII XML into the rendered PDF:
+        the output is normalized to PDF/A-3 with the XML attached as
+        ``factur-x.xml``. Not combinable with ``options.user_password`` or
+        ``options.compression``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -312,11 +392,57 @@ class AsyncPdfikClient:
             body["options"] = _to_dict(options)
         if render:
             body["render"] = _to_dict(render)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
         if test:
             body["test"] = True
 
         extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         res = await self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    async def einvoice_to_pdf(
+        self,
+        xml: str,
+        *,
+        profile: EInvoiceProfile = EInvoiceProfile.EN16931,
+        template_id: Optional[str] = None,
+        template: Optional[dict] = None,
+        webhook_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a Factur-X e-invoice job: the UN/CEFACT CII ``xml`` is
+        validated against the official XSD of the declared ``profile``, a
+        human-readable invoice is built from a block template, rendered to
+        PDF/A-3 and the XML is embedded as ``factur-x.xml`` (Factur-X /
+        ZUGFeRD hybrid). Then poll/download via the normal job flow.
+
+        ``template_id`` (a template saved in the dashboard) and ``template``
+        (an inline block-template dict) are mutually exclusive; omit both to
+        use the account default template. Available on every plan; on Free
+        the output carries a PDFik.net watermark. Profiles ``minimum`` and
+        ``basicwl`` carry accompanying data only and are NOT a legally
+        sufficient e-invoice.
+
+        Set ``test=True`` to run the job in test mode: it goes through the full
+        pipeline (statuses, webhook, download) without real rendering, and the
+        download returns a sample PDF. Quotas are not debited — test jobs are
+        free and rate-limited instead (60/min, 2,000/day). Job status
+        and webhook payloads always carry ``test: true|false``.
+        """
+        body = {"xml": xml, "profile": _to_dict(profile)}
+        if template_id:
+            body["template_id"] = template_id
+        if template:
+            body["template"] = template
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = await self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
     async def get_job(self, job_id: str) -> JobStatusResponse:

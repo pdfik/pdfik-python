@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-08-17).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -100,6 +100,39 @@ print(result.expires_at)  # e.g. "2026-08-05T12:00:00Z"
 
 pdf_bytes = client.download_pdf(job.job_id)  # sample PDF
 ```
+
+### Factur-X e-invoices
+
+Turn a UN/CEFACT Cross-Industry-Invoice XML into a Factur-X / ZUGFeRD hybrid: a human-readable PDF/A-3 with the XML embedded as `factur-x.xml`. The XML is validated against the official XSD of the declared profile before any quota is spent; the output is validated with veraPDF and Mustangproject. Schema-valid does not mean tax-compliant — the invoice content is the caller's responsibility. Available on every plan;
+
+```python
+from pdfik import PdfikClient
+
+client = PdfikClient(api_key="sk_live_...")
+
+# The visual invoice is built from a block template (saved in the dashboard,
+# passed inline as `template=`, or the built-in default when both are omitted).
+job = client.einvoice_to_pdf(
+    cii_xml,                      # your CII XML string, UTF-8, up to 1 MB
+    profile="en16931",            # minimum | basicwl | basic | en16931 | extended
+    template_id="c0ffee00-...",   # optional; mutually exclusive with template=
+)
+result = client.wait_for_job(job.job_id)
+pdf_bytes = client.download_pdf(job.job_id)
+```
+
+Alternatively, render your own page as the visual half — pass `einvoice=` to `url_to_pdf` / `html_to_pdf` and the output is normalized to PDF/A-3 with the XML embedded (not combinable with `user_password` or `compression`, which break PDF/A):
+
+```python
+from pdfik import EInvoiceOptions
+
+job = client.html_to_pdf(
+    invoice_html,
+    einvoice=EInvoiceOptions(xml=cii_xml, profile="en16931"),
+)
+```
+
+Profiles `minimum` and `basicwl` carry accompanying data only and are **not** a legally sufficient e-invoice. Error codes: [einvoice-xml-invalid](https://docs.pdfik.net/error-codes#einvoice-xml-invalid), [einvoice-options-conflict](https://docs.pdfik.net/error-codes#einvoice-options-conflict), [einvoice-template-not-found](https://docs.pdfik.net/error-codes#einvoice-template-not-found), [payload-too-large-for-queue](https://docs.pdfik.net/error-codes#payload-too-large-for-queue).
 
 ## Limits, retention and error codes
 
