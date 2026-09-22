@@ -1,3 +1,4 @@
+import json
 import time
 import asyncio
 import hmac
@@ -16,11 +17,47 @@ from .models import (
     JobAuthOptions,
     EInvoiceOptions,
     EInvoiceProfile,
+    ImageOptions,
+    DeliveryOptions,
     _to_dict
 )
 
 def _is_retryable_exception(exception: BaseException) -> bool:
     return isinstance(exception, PdfikError) and (exception.status_code >= 500 or exception.status_code == 429)
+
+def _throttle_delay(err: PdfikError, fallback: float) -> float:
+    """Seconds to wait after a 429 while polling: the API's `retry_after_seconds`
+    (capped at 60 s so the server cannot park the caller), else `fallback`."""
+    try:
+        seconds = float(json.loads(err.response_body or "{}").get("retry_after_seconds") or 0)
+        if seconds > 0:
+            return min(seconds, 60.0)
+    except Exception:
+        pass
+    return float(fallback)
+
+
+def _error_message(detail) -> Optional[str]:
+    """Readable text for an error body's ``detail``.
+
+    Request-validation errors (422) carry a LIST of ``{"loc": [...], "msg": ...}``
+    items instead of a string; printed raw they read as a Python list repr. They
+    become ``"options.viewport.width: Input should be less than or equal to 1920"``.
+    """
+    if isinstance(detail, list):
+        parts = []
+        for item in detail:
+            if isinstance(item, dict):
+                loc = ".".join(str(x) for x in item.get("loc", []) if x != "body")
+                msg = item.get("msg", "")
+                parts.append("%s: %s" % (loc, msg) if loc else str(msg))
+            else:
+                parts.append(str(item))
+        return "; ".join(p for p in parts if p) or None
+    if detail:
+        return str(detail)
+    return None
+
 
 class PdfikClient:
     def __init__(self, api_key: str, base_url: str = "https://api.pdfik.net"):
@@ -56,7 +93,7 @@ class PdfikClient:
             try:
                 data = response.json()
                 if isinstance(data, dict):
-                    message = data.get("detail", message)
+                    message = _error_message(data.get("detail")) or message
                     # pdf-api's RFC 7807 bodies carry the code in "error";
                     # "error_code" is a fallback for any body that still uses it.
                     error_code = data.get("error") or data.get("error_code")
@@ -75,6 +112,7 @@ class PdfikClient:
         render: Optional[RenderOptions] = None,
         auth: Optional[JobAuthOptions] = None,
         einvoice: Optional[EInvoiceOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -84,6 +122,13 @@ class PdfikClient:
         the output is normalized to PDF/A-3 with the XML attached as
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
+
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -102,6 +147,8 @@ class PdfikClient:
             body["auth"] = _to_dict(auth)
         if einvoice:
             body["einvoice"] = _to_dict(einvoice)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
@@ -117,6 +164,7 @@ class PdfikClient:
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
         einvoice: Optional[EInvoiceOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -126,6 +174,13 @@ class PdfikClient:
         the output is normalized to PDF/A-3 with the XML attached as
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
+
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -142,11 +197,137 @@ class PdfikClient:
             body["render"] = _to_dict(render)
         if einvoice:
             body["einvoice"] = _to_dict(einvoice)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
         extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         res = self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    def markdown_to_pdf(
+        self,
+        markdown: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that converts Markdown to a PDF.
+
+        CommonMark plus GFM tables and strikethrough are supported; raw HTML
+        inside the Markdown is escaped, not rendered — use ``html_to_pdf``
+        for full HTML control. A built-in print stylesheet is applied, and
+        ``options`` (paper format, margins, header/footer, watermark, ...)
+        works exactly as on ``html_to_pdf``. Job polling and download are
+        identical to the other PDF endpoints.
+
+        ``delivery`` (Pro+) uploads the output straight to your own bucket
+        via a presigned PUT URL; ``test=True`` runs the full pipeline without
+        real rendering. The two cannot be combined.
+        """
+        body = {"markdown": markdown}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    def url_to_image(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that captures a public URL as an image (screenshot).
+
+        ``options`` controls the output: ``format`` "png" (default) or
+        "jpeg", ``full_page`` (default False - the visible area only),
+        ``quality`` (JPEG only) and ``viewport`` (default 1024x768; width
+        320-1920, height 320-8192). Poll with
+        ``wait_for_job`` and fetch the bytes with ``download_pdf`` — for
+        image jobs the download returns ``image/png`` or ``image/jpeg``
+        instead of a PDF.
+
+        ``auth`` (Pro+) attaches basic/bearer credentials exactly as on
+        ``url_to_pdf``. ``delivery`` and ``test`` behave as on the PDF
+        endpoints and cannot be combined with each other.
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    def html_to_image(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that captures raw HTML markup as an image (screenshot).
+
+        ``options`` controls the output: ``format`` "png" (default) or
+        "jpeg", ``full_page`` (default False - the visible area only),
+        ``quality`` (JPEG only) and ``viewport`` (default 1024x768; width
+        320-1920, height 320-8192). Poll with
+        ``wait_for_job`` and fetch the bytes with ``download_pdf`` — for
+        image jobs the download returns ``image/png`` or ``image/jpeg``
+        instead of a PDF.
+
+        ``delivery`` and ``test`` behave as on the PDF endpoints and cannot
+        be combined with each other.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
     def einvoice_to_pdf(
@@ -157,6 +338,7 @@ class PdfikClient:
         template_id: Optional[str] = None,
         template: Optional[dict] = None,
         webhook_url: Optional[str] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -173,6 +355,13 @@ class PdfikClient:
         ``basicwl`` carry accompanying data only and are NOT a legally
         sufficient e-invoice.
 
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
+
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
         download returns a sample PDF. Quotas are not debited — test jobs are
@@ -186,6 +375,8 @@ class PdfikClient:
             body["template"] = template
         if webhook_url:
             body["webhook_url"] = webhook_url
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
@@ -206,7 +397,18 @@ class PdfikClient:
     ) -> JobStatusResponse:
         start_time = time.time()
         while True:
-            job = self.get_job(job_id)
+            try:
+                job = self.get_job(job_id)
+            except PdfikError as e:
+                # A 429 while polling is a throttle, not a failure: on Free (10
+                # requests/min) a render longer than ~20 s used to end the wait
+                # with an error. Wait it out, within the same timeout.
+                if e.status_code != 429:
+                    raise
+                if time.time() - start_time >= timeout:
+                    raise PdfikError(f"Job {job_id} timed out", 408, "TIMEOUT")
+                time.sleep(_throttle_delay(e, poll_interval))
+                continue
             if job.status in ("done", "failed"):
                 if job.status == "failed":
                     raise PdfikError(
@@ -230,6 +432,14 @@ class PdfikClient:
         )
 
     def download_pdf(self, job_id: str) -> bytes:
+        """Download the finished job's output bytes.
+
+        Works for every job type: PDF jobs return the PDF, image jobs
+        (``url_to_image`` / ``html_to_image``) return the raw PNG/JPEG bytes.
+        Jobs submitted with ``delivery`` have no download here — the file
+        lives in your own bucket, at the address you presigned, and this
+        endpoint answers 404.
+        """
         res = self._request("GET", f"/jobs/{job_id}/download")
         return res.content
 
@@ -308,7 +518,7 @@ class AsyncPdfikClient:
             try:
                 data = response.json()
                 if isinstance(data, dict):
-                    message = data.get("detail", message)
+                    message = _error_message(data.get("detail")) or message
                     # pdf-api's RFC 7807 bodies carry the code in "error";
                     # "error_code" is a fallback for any body that still uses it.
                     error_code = data.get("error") or data.get("error_code")
@@ -327,6 +537,7 @@ class AsyncPdfikClient:
         render: Optional[RenderOptions] = None,
         auth: Optional[JobAuthOptions] = None,
         einvoice: Optional[EInvoiceOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -336,6 +547,13 @@ class AsyncPdfikClient:
         the output is normalized to PDF/A-3 with the XML attached as
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
+
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -354,6 +572,8 @@ class AsyncPdfikClient:
             body["auth"] = _to_dict(auth)
         if einvoice:
             body["einvoice"] = _to_dict(einvoice)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
@@ -369,6 +589,7 @@ class AsyncPdfikClient:
         options: Optional[PdfOptions] = None,
         render: Optional[RenderOptions] = None,
         einvoice: Optional[EInvoiceOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -378,6 +599,13 @@ class AsyncPdfikClient:
         the output is normalized to PDF/A-3 with the XML attached as
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
+
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
 
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
@@ -394,11 +622,137 @@ class AsyncPdfikClient:
             body["render"] = _to_dict(render)
         if einvoice:
             body["einvoice"] = _to_dict(einvoice)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
         extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         res = await self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    async def markdown_to_pdf(
+        self,
+        markdown: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that converts Markdown to a PDF.
+
+        CommonMark plus GFM tables and strikethrough are supported; raw HTML
+        inside the Markdown is escaped, not rendered — use ``html_to_pdf``
+        for full HTML control. A built-in print stylesheet is applied, and
+        ``options`` (paper format, margins, header/footer, watermark, ...)
+        works exactly as on ``html_to_pdf``. Job polling and download are
+        identical to the other PDF endpoints.
+
+        ``delivery`` (Pro+) uploads the output straight to your own bucket
+        via a presigned PUT URL; ``test=True`` runs the full pipeline without
+        real rendering. The two cannot be combined.
+        """
+        body = {"markdown": markdown}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = await self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    async def url_to_image(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that captures a public URL as an image (screenshot).
+
+        ``options`` controls the output: ``format`` "png" (default) or
+        "jpeg", ``full_page`` (default False - the visible area only),
+        ``quality`` (JPEG only) and ``viewport`` (default 1024x768; width
+        320-1920, height 320-8192). Poll with
+        ``wait_for_job`` and fetch the bytes with ``download_pdf`` — for
+        image jobs the download returns ``image/png`` or ``image/jpeg``
+        instead of a PDF.
+
+        ``auth`` (Pro+) attaches basic/bearer credentials exactly as on
+        ``url_to_pdf``. ``delivery`` and ``test`` behave as on the PDF
+        endpoints and cannot be combined with each other.
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = await self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
+        return JobCreatedResponse.from_dict(res.json())
+
+    async def html_to_image(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        delivery: Optional[DeliveryOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> JobCreatedResponse:
+        """Submit a job that captures raw HTML markup as an image (screenshot).
+
+        ``options`` controls the output: ``format`` "png" (default) or
+        "jpeg", ``full_page`` (default False - the visible area only),
+        ``quality`` (JPEG only) and ``viewport`` (default 1024x768; width
+        320-1920, height 320-8192). Poll with
+        ``wait_for_job`` and fetch the bytes with ``download_pdf`` — for
+        image jobs the download returns ``image/png`` or ``image/jpeg``
+        instead of a PDF.
+
+        ``delivery`` and ``test`` behave as on the PDF endpoints and cannot
+        be combined with each other.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
+        if test:
+            body["test"] = True
+
+        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        res = await self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
     async def einvoice_to_pdf(
@@ -409,6 +763,7 @@ class AsyncPdfikClient:
         template_id: Optional[str] = None,
         template: Optional[dict] = None,
         webhook_url: Optional[str] = None,
+        delivery: Optional[DeliveryOptions] = None,
         idempotency_key: Optional[str] = None,
         test: Optional[bool] = None
     ) -> JobCreatedResponse:
@@ -425,6 +780,13 @@ class AsyncPdfikClient:
         ``basicwl`` carry accompanying data only and are NOT a legally
         sufficient e-invoice.
 
+        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        bucket via a presigned PUT URL: nothing is stored on PDFik's side,
+        the download endpoint answers 404 for such jobs, and the
+        ``job.finished`` webhook carries neither ``file_url`` nor
+        ``expires_at`` (PDFik does not record where the file went — you
+        already know). Not combinable with ``test``.
+
         Set ``test=True`` to run the job in test mode: it goes through the full
         pipeline (statuses, webhook, download) without real rendering, and the
         download returns a sample PDF. Quotas are not debited — test jobs are
@@ -438,6 +800,8 @@ class AsyncPdfikClient:
             body["template"] = template
         if webhook_url:
             body["webhook_url"] = webhook_url
+        if delivery:
+            body["delivery"] = _to_dict(delivery)
         if test:
             body["test"] = True
 
@@ -458,7 +822,16 @@ class AsyncPdfikClient:
     ) -> JobStatusResponse:
         start_time = time.time()
         while True:
-            job = await self.get_job(job_id)
+            try:
+                job = await self.get_job(job_id)
+            except PdfikError as e:
+                # Same as the sync client: a 429 while polling is waited out.
+                if e.status_code != 429:
+                    raise
+                if time.time() - start_time >= timeout:
+                    raise PdfikError(f"Job {job_id} timed out", 408, "TIMEOUT")
+                await asyncio.sleep(_throttle_delay(e, poll_interval))
+                continue
             if job.status in ("done", "failed"):
                 if job.status == "failed":
                     raise PdfikError(
@@ -482,6 +855,14 @@ class AsyncPdfikClient:
         )
 
     async def download_pdf(self, job_id: str) -> bytes:
+        """Download the finished job's output bytes.
+
+        Works for every job type: PDF jobs return the PDF, image jobs
+        (``url_to_image`` / ``html_to_image``) return the raw PNG/JPEG bytes.
+        Jobs submitted with ``delivery`` have no download here — the file
+        lives in your own bucket, at the address you presigned, and this
+        endpoint answers 404.
+        """
         res = await self._request("GET", f"/jobs/{job_id}/download")
         return res.content
 

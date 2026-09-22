@@ -10,7 +10,11 @@ from pdfik import (
     MarginOptions,
     EInvoiceOptions,
     EInvoiceProfile,
+    ImageOptions,
+    ImageViewport,
+    DeliveryOptions,
 )
+from pdfik.models import JobAuthOptions
 
 SAMPLE_CII_XML = '<?xml version="1.0" encoding="UTF-8"?><rsm:CrossIndustryInvoice/>'
 
@@ -180,6 +184,179 @@ def test_html_to_pdf_with_einvoice_option():
 
 
 @respx.mock
+def test_markdown_to_pdf_request():
+    route = respx.post("https://api.pdfik.net/markdown-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-md", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.markdown_to_pdf(
+        "# Invoice\n\nHello **world**",
+        webhook_url="https://webhook.com",
+        options=PdfOptions(format="A4", print_background=True),
+        idempotency_key="md-1",
+    )
+
+    assert res.job_id == "job-md"
+    assert res.status == "queued"
+    assert route.called
+    request = route.calls[0].request
+    assert request.headers["X-API-Key"] == "sk_test_123"
+    assert request.headers["Idempotency-Key"] == "md-1"
+
+    import json
+    body = json.loads(request.read())
+    assert body == {
+        "markdown": "# Invoice\n\nHello **world**",
+        "webhook_url": "https://webhook.com",
+        "options": {"format": "A4", "print_background": True},
+    }
+
+
+@respx.mock
+def test_url_to_image_request():
+    route = respx.post("https://api.pdfik.net/url-to-image").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-img", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.url_to_image(
+        "https://example.com",
+        options=ImageOptions(
+            format="jpeg",
+            full_page=False,
+            quality=80,
+            viewport=ImageViewport(width=1280, height=720),
+        ),
+        auth=JobAuthOptions(type="bearer", value="tok-123"),
+    )
+
+    assert res.job_id == "job-img"
+    assert res.status == "queued"
+    assert route.called
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body == {
+        "url": "https://example.com",
+        "options": {
+            "format": "jpeg",
+            "full_page": False,
+            "quality": 80,
+            "viewport": {"width": 1280, "height": 720},
+        },
+        "auth": {"type": "bearer", "value": "tok-123"},
+    }
+
+
+@respx.mock
+def test_url_to_image_default_options_send_png_and_viewport_only():
+    route = respx.post("https://api.pdfik.net/url-to-image").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-img-d", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    client.url_to_image("https://example.com", options=ImageOptions())
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    # The dataclass defaults go on the wire (only None is dropped) and match
+    # the server defaults exactly: visible area only (owner decision 2026-09-20).
+    assert body["options"] == {"format": "png", "full_page": False}
+
+
+@respx.mock
+def test_html_to_image_request():
+    route = respx.post("https://api.pdfik.net/html-to-image").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-img-h", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.html_to_image(
+        "<h1>Hello</h1>",
+        options=ImageOptions(full_page=True),
+        test=True,
+    )
+
+    assert res.job_id == "job-img-h"
+    assert route.called
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body == {
+        "html": "<h1>Hello</h1>",
+        "options": {"format": "png", "full_page": True},
+        "test": True,
+    }
+
+
+@respx.mock
+def test_delivery_body_sends_explicit_presigned_put_mode():
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-byob", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    presigned = "https://bucket.s3.eu-central-1.amazonaws.com/report.pdf?X-Amz-Signature=abc"
+    client = PdfikClient(api_key="sk_test_123")
+    # mode is not passed by the caller: the model's default spells it out.
+    client.url_to_pdf("https://example.com", delivery=DeliveryOptions(url=presigned))
+
+    import json
+    body = json.loads(route.calls[0].request.read())
+    assert body == {
+        "url": "https://example.com",
+        "delivery": {"mode": "presigned_put", "url": presigned},
+    }
+
+
+@respx.mock
+def test_delivery_accepted_by_every_job_creating_method():
+    delivery = DeliveryOptions(url="https://bucket.example.com/out?sig=1")
+    ok = httpx.Response(
+        202,
+        json={"job_id": "job-byob-2", "status": "queued", "detail": "Job successfully queued"}
+    )
+    routes = {
+        "html-to-pdf": respx.post("https://api.pdfik.net/html-to-pdf").mock(return_value=ok),
+        "markdown-to-pdf": respx.post("https://api.pdfik.net/markdown-to-pdf").mock(return_value=ok),
+        "url-to-image": respx.post("https://api.pdfik.net/url-to-image").mock(return_value=ok),
+        "html-to-image": respx.post("https://api.pdfik.net/html-to-image").mock(return_value=ok),
+        "einvoice-to-pdf": respx.post("https://api.pdfik.net/einvoice-to-pdf").mock(return_value=ok),
+    }
+
+    client = PdfikClient(api_key="sk_test_123")
+    client.html_to_pdf("<h1>Hi</h1>", delivery=delivery)
+    client.markdown_to_pdf("# Hi", delivery=delivery)
+    client.url_to_image("https://example.com", delivery=delivery)
+    client.html_to_image("<h1>Hi</h1>", delivery=delivery)
+    client.einvoice_to_pdf(SAMPLE_CII_XML, delivery=delivery)
+
+    import json
+    for name, route in routes.items():
+        assert route.called, name
+        body = json.loads(route.calls[0].request.read())
+        assert body["delivery"] == {
+            "mode": "presigned_put",
+            "url": "https://bucket.example.com/out?sig=1",
+        }, name
+
+
+@respx.mock
 def test_wait_for_job_polls():
     get_route = respx.get(url__startswith="https://api.pdfik.net/jobs/job-123")
     get_route.side_effect = [
@@ -304,6 +481,77 @@ async def test_async_einvoice_to_pdf():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_async_markdown_to_pdf():
+    route = respx.post("https://api.pdfik.net/markdown-to-pdf").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-md-async", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        res = await client.markdown_to_pdf("# Hi", test=True)
+
+        assert res.job_id == "job-md-async"
+        assert route.called
+
+        import json
+        body = json.loads(route.calls[0].request.read())
+        assert body == {"markdown": "# Hi", "test": True}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_url_to_image_with_delivery():
+    route = respx.post("https://api.pdfik.net/url-to-image").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-img-async", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        res = await client.url_to_image(
+            "https://example.com",
+            options=ImageOptions(viewport=ImageViewport(width=800, height=600)),
+            delivery=DeliveryOptions(url="https://bucket.example.com/shot.png?sig=1"),
+        )
+
+        assert res.job_id == "job-img-async"
+        assert route.called
+
+        import json
+        body = json.loads(route.calls[0].request.read())
+        assert body["options"]["viewport"] == {"width": 800, "height": 600}
+        assert body["delivery"] == {
+            "mode": "presigned_put",
+            "url": "https://bucket.example.com/shot.png?sig=1",
+        }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_html_to_image():
+    route = respx.post("https://api.pdfik.net/html-to-image").mock(
+        return_value=httpx.Response(
+            202,
+            json={"job_id": "job-img-h-async", "status": "queued", "detail": "Job successfully queued"}
+        )
+    )
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        res = await client.html_to_image("<h1>Hello</h1>", options=ImageOptions(format="jpeg", quality=70))
+
+        assert res.job_id == "job-img-h-async"
+        assert route.called
+
+        import json
+        body = json.loads(route.calls[0].request.read())
+        assert body["options"] == {"format": "jpeg", "full_page": False, "quality": 70}
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_async_wait_for_job():
     get_route = respx.get(url__startswith="https://api.pdfik.net/jobs/job-async")
     get_route.side_effect = [
@@ -347,3 +595,51 @@ def test_verify_webhook_signature():
     # Test missing headers
     assert PdfikClient.verify_webhook_signature(raw_body, {}, secret) is False
 
+def test_job_auth_options_is_importable_from_the_package_root():
+    # `auth=` is a public parameter, so its type must come from where users import
+    # everything else. The tests used to import it from pdfik.models and hid the gap.
+    from pdfik import JobAuthOptions as RootJobAuthOptions  # noqa: F401
+
+
+@respx.mock
+def test_validation_error_detail_list_becomes_a_readable_message():
+    # pdf-api answers request-validation errors (422) with `detail` as a LIST of
+    # {loc, msg}; the message used to be that list's repr.
+    respx.post("https://api.pdfik.net/url-to-image").mock(
+        return_value=httpx.Response(422, json={
+            "type": "https://docs.pdfik.net/error-codes#validation-error",
+            "title": "Unprocessable Entity - Request Validation Error",
+            "status": 422,
+            "detail": [{"loc": ["body", "options", "viewport", "width"],
+                        "msg": "Input should be less than or equal to 1920", "type": "less_than_equal"}],
+        })
+    )
+    client = PdfikClient(api_key="sk_live_test")
+    with pytest.raises(PdfikError) as exc:
+        client.url_to_image("https://example.com")
+    assert exc.value.status_code == 422
+    assert exc.value.args[0] == "options.viewport.width: Input should be less than or equal to 1920"
+
+@respx.mock
+def test_wait_for_job_waits_out_a_429_instead_of_failing():
+    # Free is 10 requests/min: a render longer than ~20 s used to end the wait
+    # with a 429 once the request-level retries (3) were spent.
+    throttled = httpx.Response(429, json={"error": "RATE_LIMIT_EXCEEDED", "detail": "Too many requests. Please try again later.", "retry_after_seconds": 0.01})
+    get_route = respx.get("https://api.pdfik.net/jobs/job-123")
+    get_route.side_effect = [throttled, throttled, throttled, httpx.Response(200, json={"status": "done"})]
+    client = PdfikClient(api_key="sk_test_123")
+    res = client.wait_for_job("job-123", timeout=60, poll_interval=0.01)
+    assert res.status == "done"
+    assert get_route.call_count == 4
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_async_wait_for_job_waits_out_a_429_instead_of_failing():
+    throttled = httpx.Response(429, json={"error": "RATE_LIMIT_EXCEEDED", "detail": "Too many requests. Please try again later.", "retry_after_seconds": 0.01})
+    get_route = respx.get("https://api.pdfik.net/jobs/job-123")
+    get_route.side_effect = [throttled, throttled, throttled, httpx.Response(200, json={"status": "done"})]
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        res = await client.wait_for_job("job-123", timeout=60, poll_interval=0.01)
+    assert res.status == "done"
+    assert get_route.call_count == 4

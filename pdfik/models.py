@@ -140,6 +140,45 @@ class JobAuthOptions:
     value: str
 
 @dataclass
+class ImageViewport:
+    # The browser window the page is opened in, in CSS pixels. You choose the
+    # size and the server captures exactly that window — nothing is scaled or
+    # fitted. width: 320-1920, height: 320-8192 (outside the range: 422).
+    width: int
+    height: int
+
+@dataclass
+class ImageOptions:
+    # Screenshot output options for url_to_image / html_to_image.
+    # format: "png" (default) or "jpeg". full_page captures the whole
+    # scrollable page instead of just the visible area; it is False by default,
+    # so the image is exactly your viewport. With True the height follows the
+    # real page and is clipped at 8192 px — a ceiling, not a target, so a
+    # 2,000 px page still gives a 2,000 px image. quality is JPEG-only, 1-100
+    # — the server rejects quality together with png (422). viewport defaults
+    # to 1024x768 server-side; it sets the image width, and with
+    # full_page=False (the default) also its height.
+    # The format/full_page defaults are sent on the wire (only None is
+    # dropped), which matches the server defaults exactly.
+    format: str = "png"
+    full_page: bool = False
+    quality: Optional[int] = None
+    viewport: Optional[ImageViewport] = None
+
+@dataclass
+class DeliveryOptions:
+    # BYOB delivery (Pro+): the rendered output is uploaded straight to your
+    # own bucket via this presigned HTTPS PUT URL; nothing is stored on
+    # PDFik's side. Presign for at least 15 minutes and without a
+    # Content-Type condition (the upload sends none). For delivered jobs the
+    # job.finished webhook carries neither file_url nor expires_at (PDFik does
+    # not record the destination), and the download endpoint answers 404.
+    # Not combinable with test mode.
+    url: str
+    # Only "presigned_put" exists; sent explicitly on the wire.
+    mode: str = "presigned_put"
+
+@dataclass
 class EInvoiceOptions:
     # Attach a Factur-X e-invoice to a url_to_pdf/html_to_pdf render: the
     # rendered page becomes the human-readable half, the output is normalized

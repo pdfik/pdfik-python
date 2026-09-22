@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-22).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -101,6 +101,59 @@ print(result.expires_at)  # e.g. "2026-08-05T12:00:00Z"
 pdf_bytes = client.download_pdf(job.job_id)  # sample PDF
 ```
 
+### Markdown to PDF
+
+`markdown_to_pdf` converts Markdown (CommonMark + GFM tables and strikethrough) with a built-in print stylesheet. Raw HTML inside the Markdown is escaped, not rendered — use `html_to_pdf` for full HTML control. The same `options` (paper format, margins, header/footer, watermark, ...) and job flow apply. The Markdown may be up to 100,000 characters (longer input is rejected with `422`); Markdown whose converted document is too large for the processing queue is rejected with `413` ([payload-too-large-for-queue](https://docs.pdfik.net/error-codes#payload-too-large-for-queue)) and is not charged. Example:
+
+```python
+job = client.markdown_to_pdf(
+    "# Report\n\n| Item | Price |\n| --- | --- |\n| Render | $0.01 |",
+    options=PdfOptions(format="A4"),
+)
+result = client.wait_for_job(job.job_id)
+pdf_bytes = client.download_pdf(job.job_id)
+```
+
+### Screenshots
+
+`url_to_image` / `html_to_image` capture a page as a PNG (default) or JPEG instead of a PDF. `ImageOptions`: `format` (`"png"` | `"jpeg"`), `full_page` (default `False` - the visible area only; with `True` the height follows the real page and is clipped at 8,192 px, which is a ceiling and not a target, so a 2,000 px page still gives a 2,000 px image, and horizontal overflow beyond the viewport width is never captured), `quality` (1-100, JPEG only) and `viewport` (`ImageViewport(width, height)`; you pick the window size and we capture exactly that - nothing is scaled or fitted - `width` 320-1920, `height` 320-8192, defaults to 1024x768). Polling is identical to the PDF endpoints, and `download_pdf` returns the raw image bytes (`image/png` or `image/jpeg`, filename `{job_id}.png`/`.jpg`):
+
+```python
+from pdfik import ImageOptions, ImageViewport
+
+job = client.url_to_image(
+    "https://example.com",
+    options=ImageOptions(
+        format="jpeg",
+        quality=80,
+        full_page=True,
+        viewport=ImageViewport(width=1280, height=720),
+    ),
+)
+result = client.wait_for_job(job.job_id)
+image_bytes = client.download_pdf(job.job_id)  # JPEG bytes
+
+shot = client.html_to_image("<h1>Hello</h1>")  # 1024x768 PNG
+```
+
+`url_to_image` also accepts the Pro+ `auth` option (basic/bearer), exactly as `url_to_pdf`. Passing `quality` together with PNG is rejected with `422`.
+
+### Deliver to your own bucket (BYOB)
+
+Pass `delivery=` (Pro+, on every job-creating method) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
+
+```python
+from pdfik import DeliveryOptions
+
+job = client.url_to_pdf(
+    "https://example.com",
+    delivery=DeliveryOptions(url=presigned_put_url),  # mode "presigned_put" is the only mode
+)
+client.wait_for_job(job.job_id)  # "done" means the PUT to your bucket succeeded
+```
+
+Once a delivered job is done, the `job.finished` webhook reports the outcome only: it carries neither `file_url` nor `expires_at`, because PDFik keeps no copy and never records where the file went (the presigned URL is a credential, so it is used once and forgotten). You already know the destination — you signed it. `download_pdf` answers `404` ([output-delivered-externally](https://docs.pdfik.net/error-codes#output-delivered-externally)) — the file only exists in your bucket. `delivery` cannot be combined with `test=True` (`400`).
+
 ### Factur-X e-invoices
 
 Turn a UN/CEFACT Cross-Industry-Invoice XML into a Factur-X / ZUGFeRD hybrid: a human-readable PDF/A-3 with the XML embedded as `factur-x.xml`. The XML is validated against the official XSD of the declared profile before any quota is spent; the output is validated with veraPDF and Mustangproject. Schema-valid does not mean tax-compliant — the invoice content is the caller's responsibility. Available on every plan;
@@ -181,7 +234,8 @@ async def handle_webhook(request: Request):
         
     # Process event
     event = await request.json()
-    print(f"Received webhook event: {event.get('event_type')} for job: {event.get('job_id')}")
+    # The payload has no event type: a finished job carries status "done" (or "failed").
+    print(f"Job {event.get('job_id')} finished with status {event.get('status')}")
     
     return {"received": True}
 ```
