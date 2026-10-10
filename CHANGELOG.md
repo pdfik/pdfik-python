@@ -4,6 +4,21 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-10-10
+
+A documentation-only release: no API or behaviour change in the client. Code written
+against 0.4.0 runs unchanged.
+
+### Changed
+- BYOB `delivery` is available on every plan, Free included — a server-side change of
+  2026-10-09; it used to be Pro+. The README section "Deliver to your own bucket (BYOB)"
+  and the comment on `DeliveryOptions` now say "every plan", and the docstrings of
+  `url_to_pdf`, `html_to_pdf`, `markdown_to_pdf` and `einvoice_to_pdf` (sync and async)
+  no longer say "Pro+". The 0.4.0 entry below describes the gate as it was at the time:
+  the API no longer answers `402 PLAN_UPGRADE_REQUIRED` with `feature: "delivery"` on
+  Free/Starter.
+- Version `0.4.0` → `0.4.1` (`pyproject.toml`).
+
 ## [0.4.0] — 2026-09-19
 
 The screenshots + Markdown + BYOB delivery release.

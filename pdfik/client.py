@@ -123,7 +123,7 @@ class PdfikClient:
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor
@@ -175,7 +175,7 @@ class PdfikClient:
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor
@@ -226,7 +226,7 @@ class PdfikClient:
         works exactly as on ``html_to_pdf``. Job polling and download are
         identical to the other PDF endpoints.
 
-        ``delivery`` (Pro+) uploads the output straight to your own bucket
+        ``delivery`` uploads the output straight to your own bucket
         via a presigned PUT URL; ``test=True`` runs the full pipeline without
         real rendering. The two cannot be combined.
         """
@@ -355,7 +355,7 @@ class PdfikClient:
         ``basicwl`` carry accompanying data only and are NOT a legally
         sufficient e-invoice.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor
@@ -548,7 +548,7 @@ class AsyncPdfikClient:
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor
@@ -600,7 +600,7 @@ class AsyncPdfikClient:
         ``factur-x.xml``. Not combinable with ``options.user_password`` or
         ``options.compression``.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor
@@ -651,7 +651,7 @@ class AsyncPdfikClient:
         works exactly as on ``html_to_pdf``. Job polling and download are
         identical to the other PDF endpoints.
 
-        ``delivery`` (Pro+) uploads the output straight to your own bucket
+        ``delivery`` uploads the output straight to your own bucket
         via a presigned PUT URL; ``test=True`` runs the full pipeline without
         real rendering. The two cannot be combined.
         """
@@ -780,7 +780,7 @@ class AsyncPdfikClient:
         ``basicwl`` carry accompanying data only and are NOT a legally
         sufficient e-invoice.
 
-        Pass ``delivery`` (Pro+) to upload the output straight to your own
+        Pass ``delivery`` to upload the output straight to your own
         bucket via a presigned PUT URL: nothing is stored on PDFik's side,
         the download endpoint answers 404 for such jobs, and the
         ``job.finished`` webhook carries neither ``file_url`` nor

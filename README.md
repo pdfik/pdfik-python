@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-22).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-10).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -140,7 +140,7 @@ shot = client.html_to_image("<h1>Hello</h1>")  # 1024x768 PNG
 
 ### Deliver to your own bucket (BYOB)
 
-Pass `delivery=` (Pro+, on every job-creating method) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
+Pass `delivery=` (every plan, on every job-creating method) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
 
 ```python
 from pdfik import DeliveryOptions

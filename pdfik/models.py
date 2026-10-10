@@ -167,7 +167,7 @@ class ImageOptions:
 
 @dataclass
 class DeliveryOptions:
-    # BYOB delivery (Pro+): the rendered output is uploaded straight to your
+    # BYOB delivery (every plan): the rendered output is uploaded straight to your
     # own bucket via this presigned HTTPS PUT URL; nothing is stored on
     # PDFik's side. Presign for at least 15 minutes and without a
     # Content-Type condition (the upload sends none). For delivered jobs the
