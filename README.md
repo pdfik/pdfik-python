@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-10).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-12).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -11,7 +11,8 @@ Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed w
 
 - **Type Safety**: Type hints for all options and response objects.
 - **Sync & Async**: Exposes both `PdfikClient` and `AsyncPdfikClient` using the modern `httpx` engine.
-- **Auto Retry**: Automatic exponential backoff for `5xx` and `429` (Rate Limit) errors powered by `tenacity`.
+- **Auto Retry**: `5xx` and connection errors are retried with exponential backoff (powered by `tenacity`). A rate-limit or concurrency-limit `429` is waited out for the time the API states (at most 60 s, up to five times in a row) on every call — create, status, download — not only while polling, and so is a busy file on `download_pdf`. Every other `429` (byte quota, test-mode caps, exhausted download attempts) is raised at once.
+- **No duplicate jobs**: every create call carries an `Idempotency-Key` header — the `idempotency_key=` you pass, or a random UUID generated once per call and repeated on every resend — so a retried create returns the original job instead of making (and billing) a second one.
 - **DX Affordances**: Built-in polling logic (`wait_for_job`) and file download helpers.
 
 ## Installation
@@ -192,7 +193,7 @@ Profiles `minimum` and `basicwl` carry accompanying data only and are **not** a 
 - **Generated volume per month** (byte quota, counts rendered output only — downloads are free): Free 0.5 GB, Starter 10 GB, Pro 50 GB, Business 300 GB. Business plans can purchase additional +1 GB blocks from the dashboard. Exceeding the quota returns `429` ([quota-bytes-exceeded](https://docs.pdfik.net/error-codes#quota-bytes-exceeded)).
 - **File size**: up to 150 MB per PDF on every plan — contact support if you need more. A larger render fails the job with `FILE_TOO_LARGE` ([file-too-large](https://docs.pdfik.net/error-codes#file-too-large)).
 - **Retention**: each file is available for download for 24 hours after the job finishes; the exact deadline is the `expires_at` field in the job status and webhook payload. After that the download returns `410` ([file-expired](https://docs.pdfik.net/error-codes#file-expired)).
-- **Downloads**: at most 3 download attempts per file (counted when the stream starts); after that the API returns `429` ([download-attempts-exhausted](https://docs.pdfik.net/error-codes#download-attempts-exhausted)) — re-render the file or contact support. Only 1 download stream may be active at a time; a concurrent request returns `429` ([download-busy](https://docs.pdfik.net/error-codes#download-busy)) — wait ~10 seconds and retry, it does not burn an attempt.
+- **Downloads**: at most 3 download attempts per file (counted when the stream starts); after that the API returns `429` ([download-attempts-exhausted](https://docs.pdfik.net/error-codes#download-attempts-exhausted)) — re-render the file or contact support. Only 1 download stream may be active at a time; a concurrent request returns `429` ([download-busy](https://docs.pdfik.net/error-codes#download-busy)), which does not burn an attempt — `download_pdf` waits the ~10 seconds the API names and asks again by itself (up to five times), so you only see this error if the file stays busy.
 
 ### Handling Webhooks
 

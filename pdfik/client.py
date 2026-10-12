@@ -3,7 +3,8 @@ import time
 import asyncio
 import hmac
 import hashlib
-from typing import Optional
+import uuid
+from typing import Optional, Tuple
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -22,18 +23,62 @@ from .models import (
     _to_dict
 )
 
-def _is_retryable_exception(exception: BaseException) -> bool:
-    return isinstance(exception, PdfikError) and (exception.status_code >= 500 or exception.status_code == 429)
+# The two 429s that clear by themselves within a minute: the per-account request
+# rate and the in-flight job cap. A byte-quota 429, the test-mode caps and an
+# exhausted download counter do not, so they are raised at once.
+_THROTTLE_CASES = ("rate-limit-exceeded", "concurrency-limit-exceeded")
+# The download call has a third one: another stream of the same file is still open.
+# It clears within seconds and costs no download attempt. An exhausted download
+# counter is a 429 too and stays out: waiting cannot bring the attempts back.
+_DOWNLOAD_THROTTLE_CASES = _THROTTLE_CASES + ("download-busy",)
+# A throttle is waited out, not counted as a failed attempt — but not forever:
+# after this many waits in a row the 429 is raised.
+_THROTTLE_WAITS = 5
+_RETRY_AFTER_FALLBACK = 10.0
+_RETRY_AFTER_CAP = 60.0
 
-def _throttle_delay(err: PdfikError, fallback: float) -> float:
-    """Seconds to wait after a 429 while polling: the API's `retry_after_seconds`
-    (capped at 60 s so the server cannot park the caller), else `fallback`."""
+def _is_retryable_exception(exception: BaseException) -> bool:
+    return isinstance(exception, PdfikError) and exception.status_code >= 500
+
+def _idempotency_header(idempotency_key: Optional[str]) -> dict:
+    # Built once per create call, outside _request: _request runs again for every
+    # resend, and a resend must carry the key of the first attempt — the API then
+    # answers with the job that attempt created instead of creating a second one.
+    return {"Idempotency-Key": idempotency_key or str(uuid.uuid4())}
+
+def _problem(err: PdfikError) -> dict:
     try:
-        seconds = float(json.loads(err.response_body or "{}").get("retry_after_seconds") or 0)
+        data = json.loads(err.response_body or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _is_throttled(err: PdfikError, cases: Tuple[str, ...] = _THROTTLE_CASES) -> bool:
+    """True for a 429 that is one of ``cases``: the fragment of the problem's
+    ``type`` URL or, as the API sends today, the ``error`` code in upper snake
+    case."""
+    if err.status_code != 429:
+        return False
+    problem_type = str(_problem(err).get("type") or "")
+    code = str(err.error_code or "").upper()
+    return any(
+        problem_type.endswith("#" + case) or code == case.replace("-", "_").upper()
+        for case in cases
+    )
+
+def _throttle_delay(err: PdfikError, fallback: float, retry_after: Optional[str] = None) -> float:
+    """Seconds to wait after a 429: the API's `retry_after_seconds`, else its
+    `Retry-After` header (both capped at 60 s so the server cannot park the
+    caller), else `fallback`."""
+    for stated in (_problem(err).get("retry_after_seconds"), retry_after):
+        if stated is None:
+            continue
+        try:
+            seconds = float(stated)
+        except (TypeError, ValueError, OverflowError):
+            continue
         if seconds > 0:
-            return min(seconds, 60.0)
-    except Exception:
-        pass
+            return min(seconds, _RETRY_AFTER_CAP)
     return float(fallback)
 
 
@@ -59,6 +104,22 @@ def _error_message(detail) -> Optional[str]:
     return None
 
 
+def _error_from(response: httpx.Response) -> PdfikError:
+    error_code = None
+    message = f"API request failed with status {response.status_code}"
+    response_body = response.text
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            message = _error_message(data.get("detail")) or message
+            # pdf-api's RFC 7807 bodies carry the code in "error";
+            # "error_code" is a fallback for any body that still uses it.
+            error_code = data.get("error") or data.get("error_code")
+    except Exception:
+        pass
+    return PdfikError(message, response.status_code, error_code, response_body)
+
+
 class PdfikClient:
     def __init__(self, api_key: str, base_url: str = "https://api.pdfik.net"):
         if not api_key:
@@ -73,7 +134,7 @@ class PdfikClient:
         retry=retry_if_exception(_is_retryable_exception),
         reraise=True
     )
-    def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None) -> httpx.Response:
+    def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
         url = f"{self.base_url}{path}"
         headers = {
             "X-API-Key": self.api_key,
@@ -81,27 +142,23 @@ class PdfikClient:
         if extra_headers:
             headers.update(extra_headers)
 
-        try:
-            response = self.client.request(method, url, headers=headers, json=json_data)
-        except httpx.RequestError as exc:
-            raise PdfikError(f"Connection failed: {exc}", 503)
-
-        if response.is_error:
-            error_code = None
-            message = f"API request failed with status {response.status_code}"
-            response_body = response.text
+        waits = 0
+        while True:
             try:
-                data = response.json()
-                if isinstance(data, dict):
-                    message = _error_message(data.get("detail")) or message
-                    # pdf-api's RFC 7807 bodies carry the code in "error";
-                    # "error_code" is a fallback for any body that still uses it.
-                    error_code = data.get("error") or data.get("error_code")
-            except Exception:
-                pass
-            raise PdfikError(message, response.status_code, error_code, response_body)
-            
-        return response
+                response = self.client.request(method, url, headers=headers, json=json_data)
+            except httpx.RequestError as exc:
+                raise PdfikError(f"Connection failed: {exc}", 503)
+
+            if not response.is_error:
+                return response
+
+            error = _error_from(response)
+            # A throttled request created no job and started no download stream, so
+            # sending it again is safe.
+            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
+                raise error
+            waits += 1
+            time.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
 
     def url_to_pdf(
         self,
@@ -152,7 +209,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/url-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -202,7 +259,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -242,7 +299,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -286,7 +343,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -326,7 +383,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -380,7 +437,7 @@ class PdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -398,7 +455,10 @@ class PdfikClient:
         start_time = time.time()
         while True:
             try:
-                job = self.get_job(job_id)
+                # throttle_waits=0: the waiting is done below, where `timeout` is
+                # checked — the request path must not wait for the same 429 too.
+                res = self._request("GET", f"/jobs/{job_id}", throttle_waits=0)
+                job = JobStatusResponse.from_dict(res.json())
             except PdfikError as e:
                 # A 429 while polling is a throttle, not a failure: on Free (10
                 # requests/min) a render longer than ~20 s used to end the wait
@@ -440,7 +500,7 @@ class PdfikClient:
         lives in your own bucket, at the address you presigned, and this
         endpoint answers 404.
         """
-        res = self._request("GET", f"/jobs/{job_id}/download")
+        res = self._request("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
         return res.content
 
     def close(self):
@@ -498,7 +558,7 @@ class AsyncPdfikClient:
         retry=retry_if_exception(_is_retryable_exception),
         reraise=True
     )
-    async def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None) -> httpx.Response:
+    async def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
         url = f"{self.base_url}{path}"
         headers = {
             "X-API-Key": self.api_key,
@@ -506,27 +566,22 @@ class AsyncPdfikClient:
         if extra_headers:
             headers.update(extra_headers)
 
-        try:
-            response = await self.client.request(method, url, headers=headers, json=json_data)
-        except httpx.RequestError as exc:
-            raise PdfikError(f"Connection failed: {exc}", 503)
-
-        if response.is_error:
-            error_code = None
-            message = f"API request failed with status {response.status_code}"
-            response_body = response.text
+        waits = 0
+        while True:
             try:
-                data = response.json()
-                if isinstance(data, dict):
-                    message = _error_message(data.get("detail")) or message
-                    # pdf-api's RFC 7807 bodies carry the code in "error";
-                    # "error_code" is a fallback for any body that still uses it.
-                    error_code = data.get("error") or data.get("error_code")
-            except Exception:
-                pass
-            raise PdfikError(message, response.status_code, error_code, response_body)
-            
-        return response
+                response = await self.client.request(method, url, headers=headers, json=json_data)
+            except httpx.RequestError as exc:
+                raise PdfikError(f"Connection failed: {exc}", 503)
+
+            if not response.is_error:
+                return response
+
+            error = _error_from(response)
+            # Same as the sync client: a throttle is waited out and the request resent.
+            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
+                raise error
+            waits += 1
+            await asyncio.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
 
     async def url_to_pdf(
         self,
@@ -577,7 +632,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/url-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -627,7 +682,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -667,7 +722,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -711,7 +766,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -751,7 +806,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -805,7 +860,7 @@ class AsyncPdfikClient:
         if test:
             body["test"] = True
 
-        extra_headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
@@ -823,9 +878,11 @@ class AsyncPdfikClient:
         start_time = time.time()
         while True:
             try:
-                job = await self.get_job(job_id)
+                res = await self._request("GET", f"/jobs/{job_id}", throttle_waits=0)
+                job = JobStatusResponse.from_dict(res.json())
             except PdfikError as e:
-                # Same as the sync client: a 429 while polling is waited out.
+                # Same as the sync client: a 429 while polling is waited out here,
+                # not in the request path.
                 if e.status_code != 429:
                     raise
                 if time.time() - start_time >= timeout:
@@ -863,7 +920,7 @@ class AsyncPdfikClient:
         lives in your own bucket, at the address you presigned, and this
         endpoint answers 404.
         """
-        res = await self._request("GET", f"/jobs/{job_id}/download")
+        res = await self._request("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
         return res.content
 
     async def close(self):

@@ -4,6 +4,49 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-10-12
+
+A bug-fix release: no new options and no signature changes. Code written against 0.4.1
+runs unchanged, and `5xx` responses and connection failures are retried exactly as
+before (three attempts with exponential backoff).
+
+### Fixed
+- A rate-limit `429` on a create call, on `get_job` or on `download_pdf` (sync and async)
+  is now waited out the way it already was while polling: the client sleeps for the time
+  the API states (`retry_after_seconds`, else the `Retry-After` header, else 10 s; never
+  more than 60 s) and sends the request again — up to five times in a row, after which
+  the `429` is raised as before. The in-flight job cap (`CONCURRENCY_LIMIT_EXCEEDED`) is
+  handled the same way. Such a `429` used to get three attempts within about three
+  seconds and then fail, so on Free (10 requests/min) a program that created a job,
+  polled and downloaded could fail at the download, or at the create call, whenever the
+  per-minute window was full.
+- Quota `429`s are no longer retried: the monthly byte quota (`BYTE_QUOTA_EXCEEDED`), the
+  test-mode caps (`TEST_RATE_LIMIT_EXCEEDED`) and an exhausted download counter
+  ([download-attempts-exhausted](https://docs.pdfik.net/error-codes#download-attempts-exhausted))
+  are raised at once. Waiting a few seconds cannot clear them, and each used to cost
+  three requests.
+- `download_pdf` (sync and async) waits out a busy file
+  ([download-busy](https://docs.pdfik.net/error-codes#download-busy)): the `429` the API
+  answers while another stream of the same file is still open. It clears by itself within
+  seconds and costs no download attempt, so the client sleeps the time the `Retry-After`
+  header names (10 s; same fallback and 60 s cap as above) and asks again. These waits
+  count toward the same five in a row; after them the `429` is raised.
+- A retried create call can no longer produce a second job. Every create method
+  (`url_to_pdf`, `html_to_pdf`, `markdown_to_pdf`, `url_to_image`, `html_to_image`,
+  `einvoice_to_pdf`; sync and async) now always sends an `Idempotency-Key` header: the
+  `idempotency_key=` you pass, unchanged, or — when you pass none — one random UUID
+  generated per call and repeated on every resend of that call, after a `5xx` and after
+  a waited-out `429` alike. The API answers a repeated key with the original job. Before,
+  when a `5xx` or a dropped connection reached the client after the API had already
+  created the job, the request was sent again without a key, and the account got two
+  jobs and was charged twice. `get_job`, `wait_for_job` and `download_pdf` send no such
+  header.
+- `wait_for_job` spends one request on a throttled poll, not three, and then waits the
+  stated time once.
+
+### Changed
+- Version `0.4.1` → `0.4.2` (`pyproject.toml`).
+
 ## [0.4.1] — 2026-10-10
 
 A documentation-only release: no API or behaviour change in the client. Code written
