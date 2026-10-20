@@ -36,6 +36,12 @@ _DOWNLOAD_THROTTLE_CASES = _THROTTLE_CASES + ("download-busy",)
 _THROTTLE_WAITS = 5
 _RETRY_AFTER_FALLBACK = 10.0
 _RETRY_AFTER_CAP = 60.0
+# The per-request budget of a synchronous (`wait: true`) call. The clients are
+# built with httpx's defaults — 5 s of READ timeout — which would cut a held
+# request long before the server's 45 s render budget. 70 s leaves room for the
+# hold, the file transfer and the gateways in between, without parking the
+# caller forever when a proxy swallows the response.
+_SYNC_WAIT_TIMEOUT = httpx.Timeout(70.0, connect=10.0)
 
 def _is_retryable_exception(exception: BaseException) -> bool:
     return isinstance(exception, PdfikError) and exception.status_code >= 500
@@ -120,6 +126,37 @@ def _error_from(response: httpx.Response) -> PdfikError:
     return PdfikError(message, response.status_code, error_code, response_body)
 
 
+def _sync_file_bytes(response: httpx.Response) -> bytes:
+    """The file bytes of a synchronous (``wait: true``) success.
+
+    An OLD server that predates ``wait`` ignores the unknown field and answers
+    the ordinary 202 JSON — handing that back as file bytes would save a few
+    lines of JSON as output.pdf, and nobody notices until a reader chokes on
+    it. So a 202, or JSON on any 2xx, raises instead and names the job id: the
+    job WAS created and renders normally, it just has to be fetched the
+    asynchronous way (``wait_for_job`` + ``download_pdf``).
+    """
+    content_type = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if response.status_code == 202 or content_type == "application/json":
+        job_id = None
+        try:
+            data = response.json()
+            if isinstance(data, dict) and data.get("job_id"):
+                job_id = str(data["job_id"])
+        except Exception:
+            job_id = None
+        raise PdfikError(
+            "The server answered %d with JSON instead of the file: it does not "
+            "support wait=true. Job %s was still created and renders normally - "
+            "fetch it with wait_for_job() + download_pdf(), or use the plain "
+            "create method against this server." % (response.status_code, job_id or "(id unreadable)"),
+            response.status_code,
+            "SYNC_MODE_UNSUPPORTED",
+            response.text,
+        )
+    return response.content
+
+
 class PdfikClient:
     def __init__(self, api_key: str, base_url: str = "https://api.pdfik.net"):
         if not api_key:
@@ -159,6 +196,53 @@ class PdfikClient:
                 raise error
             waits += 1
             time.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
+
+    def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS) -> httpx.Response:
+        """One attempt, outside tenacity — the request path of the synchronous
+        (``wait: true``) ``*_file`` methods.
+
+        It deliberately duplicates ``_request``'s loop instead of calling it:
+        a held request must never be resent after a 5xx or a dropped
+        connection, because by the time such an answer reaches us the render
+        may already have finished and been charged, and unlike the 202 flow
+        there is no job id in hand to deduplicate against. The 503 SYNC_TIMEOUT
+        in particular says "cancelled, NOT charged, retry if YOU want" — an
+        automatic resend would burn another 45 s on a render we already know is
+        too slow. Throttle 429s ARE still waited out: a throttled request
+        created no job, so resending it under the same Idempotency-Key is safe.
+        The per-request timeout overrides the client's default (5 s of read
+        timeout), which would cut every held request short.
+        """
+        url = f"{self.base_url}{path}"
+        headers = {
+            "X-API-Key": self.api_key,
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        waits = 0
+        while True:
+            try:
+                response = self.client.request(method, url, headers=headers, json=json_data, timeout=_SYNC_WAIT_TIMEOUT)
+            except httpx.RequestError as exc:
+                raise PdfikError(f"Connection failed: {exc}", 503)
+
+            if not response.is_error:
+                return response
+
+            error = _error_from(response)
+            if not _is_throttled(error) or waits >= throttle_waits:
+                raise error
+            waits += 1
+            time.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
+
+    def _request_file(self, path: str, body: dict, idempotency_key: Optional[str]) -> bytes:
+        # `wait: true` turns the create into a held request: the answer is the
+        # file itself (or an RFC 7807 problem), never a job id to poll.
+        body["wait"] = True
+        extra_headers = _idempotency_header(idempotency_key)
+        res = self._request_once("POST", path, json_data=body, extra_headers=extra_headers)
+        return _sync_file_bytes(res)
 
     def url_to_pdf(
         self,
@@ -213,6 +297,60 @@ class PdfikClient:
         res = self._request("POST", "/url-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    def url_to_pdf_file(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Render a public URL to a PDF in ONE call and return the PDF bytes.
+
+        ``url_to_pdf``'s request sent with ``wait: true``: the API holds it
+        until the render finishes (45 s at most) and answers with the file
+        itself. Same keyword arguments as ``url_to_pdf`` except ``delivery`` —
+        the response already IS the delivery. The file also stays downloadable
+        for the normal 24 h under the job id the ``X-PDFik-Job-Id`` response
+        header names.
+
+        Raises ``PdfikError`` instead of returning:
+
+        - ``SYNC_TIMEOUT`` (503) after 45 s. The job was cancelled, nothing was
+          charged and the Idempotency-Key was released, so trying again is safe
+          — but the client never resends this one by itself: the render was
+          already too slow once, and a page that slow belongs in the
+          asynchronous flow (``url_to_pdf`` + webhook or ``wait_for_job``).
+        - the job's own error code (422, e.g. ``PAGE_TIMEOUT``) when the render
+          itself failed.
+        - ``SYNC_MODE_UNSUPPORTED`` naming the created job when an old API
+          ignores ``wait`` and answers the plain 202 JSON — that job still
+          renders and can be fetched with ``wait_for_job`` + ``download_pdf``.
+
+        Unlike every other call, a 5xx or a dropped connection is NOT retried
+        here (the render may have finished — and been charged — by then);
+        throttle 429s are waited out as usual, under one Idempotency-Key.
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
+        if test:
+            body["test"] = True
+
+        return self._request_file("/url-to-pdf", body, idempotency_key)
+
     def html_to_pdf(
         self,
         html: str,
@@ -263,6 +401,39 @@ class PdfikClient:
         res = self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    def html_to_pdf_file(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Render raw HTML to a PDF in ONE call and return the PDF bytes.
+
+        ``html_to_pdf`` sent with ``wait: true`` — same keyword arguments
+        except ``delivery`` (the response is the delivery). See
+        ``url_to_pdf_file`` for the synchronous contract: 503 ``SYNC_TIMEOUT``
+        (job cancelled, not charged, never auto-resent), 422 with the job's own
+        error code, and a clear error when an old server answers 202 JSON.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
+        if test:
+            body["test"] = True
+
+        return self._request_file("/html-to-pdf", body, idempotency_key)
+
     def markdown_to_pdf(
         self,
         markdown: str,
@@ -302,6 +473,36 @@ class PdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    def markdown_to_pdf_file(
+        self,
+        markdown: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Convert Markdown to a PDF in ONE call and return the PDF bytes.
+
+        ``markdown_to_pdf`` sent with ``wait: true`` — same keyword arguments
+        except ``delivery`` (the response is the delivery). See
+        ``url_to_pdf_file`` for the synchronous contract: 503 ``SYNC_TIMEOUT``
+        (job cancelled, not charged, never auto-resent), 422 with the job's own
+        error code, and a clear error when an old server answers 202 JSON.
+        """
+        body = {"markdown": markdown}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if test:
+            body["test"] = True
+
+        return self._request_file("/markdown-to-pdf", body, idempotency_key)
 
     def url_to_image(
         self,
@@ -347,6 +548,40 @@ class PdfikClient:
         res = self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    def url_to_image_file(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Capture a public URL as an image in ONE call and return the raw
+        PNG or JPEG bytes (whichever ``options.format`` asked for).
+
+        ``url_to_image`` sent with ``wait: true`` — same keyword arguments
+        except ``delivery`` (the response is the delivery). See
+        ``url_to_pdf_file`` for the synchronous contract: 503 ``SYNC_TIMEOUT``
+        (job cancelled, not charged, never auto-resent), 422 with the job's own
+        error code, and a clear error when an old server answers 202 JSON.
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if test:
+            body["test"] = True
+
+        return self._request_file("/url-to-image", body, idempotency_key)
+
     def html_to_image(
         self,
         html: str,
@@ -386,6 +621,37 @@ class PdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    def html_to_image_file(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Capture raw HTML as an image in ONE call and return the raw PNG or
+        JPEG bytes (whichever ``options.format`` asked for).
+
+        ``html_to_image`` sent with ``wait: true`` — same keyword arguments
+        except ``delivery`` (the response is the delivery). See
+        ``url_to_pdf_file`` for the synchronous contract: 503 ``SYNC_TIMEOUT``
+        (job cancelled, not charged, never auto-resent), 422 with the job's own
+        error code, and a clear error when an old server answers 202 JSON.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if test:
+            body["test"] = True
+
+        return self._request_file("/html-to-image", body, idempotency_key)
 
     def einvoice_to_pdf(
         self,
@@ -440,6 +706,41 @@ class PdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    def einvoice_to_pdf_file(
+        self,
+        xml: str,
+        *,
+        profile: EInvoiceProfile = EInvoiceProfile.EN16931,
+        template_id: Optional[str] = None,
+        template: Optional[dict] = None,
+        webhook_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Build a Factur-X e-invoice in ONE call and return the PDF/A-3 bytes.
+
+        ``einvoice_to_pdf`` sent with ``wait: true`` — same keyword arguments
+        except ``delivery`` (the response is the delivery). See
+        ``url_to_pdf_file`` for the synchronous contract: 503 ``SYNC_TIMEOUT``
+        (job cancelled, not charged, never auto-resent), 422 with the job's own
+        error code, and a clear error when an old server answers 202 JSON.
+        Note: the "minimum/basicwl is not a legally sufficient e-invoice" note
+        that rides the async 202's ``detail`` arrives here as the
+        ``X-PDFik-Warning`` response header, which this bytes-only helper does
+        not surface — the bytes are the complete output either way.
+        """
+        body = {"xml": xml, "profile": _to_dict(profile)}
+        if template_id:
+            body["template_id"] = template_id
+        if template:
+            body["template"] = template
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if test:
+            body["test"] = True
+
+        return self._request_file("/einvoice-to-pdf", body, idempotency_key)
 
     def get_job(self, job_id: str) -> JobStatusResponse:
         res = self._request("GET", f"/jobs/{job_id}")
@@ -583,6 +884,42 @@ class AsyncPdfikClient:
             waits += 1
             await asyncio.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
 
+    async def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS) -> httpx.Response:
+        """One attempt, outside tenacity — same as the sync client's
+        ``_request_once`` (see there for WHY a ``wait: true`` request must never
+        be resent after a 5xx or a dropped connection, while throttle 429s are
+        still waited out under one Idempotency-Key)."""
+        url = f"{self.base_url}{path}"
+        headers = {
+            "X-API-Key": self.api_key,
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        waits = 0
+        while True:
+            try:
+                response = await self.client.request(method, url, headers=headers, json=json_data, timeout=_SYNC_WAIT_TIMEOUT)
+            except httpx.RequestError as exc:
+                raise PdfikError(f"Connection failed: {exc}", 503)
+
+            if not response.is_error:
+                return response
+
+            error = _error_from(response)
+            if not _is_throttled(error) or waits >= throttle_waits:
+                raise error
+            waits += 1
+            await asyncio.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
+
+    async def _request_file(self, path: str, body: dict, idempotency_key: Optional[str]) -> bytes:
+        # Same as the sync client: `wait: true` makes the answer the file
+        # itself (or an RFC 7807 problem), never a job id to poll.
+        body["wait"] = True
+        extra_headers = _idempotency_header(idempotency_key)
+        res = await self._request_once("POST", path, json_data=body, extra_headers=extra_headers)
+        return _sync_file_bytes(res)
+
     async def url_to_pdf(
         self,
         url: str,
@@ -636,6 +973,42 @@ class AsyncPdfikClient:
         res = await self._request("POST", "/url-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    async def url_to_pdf_file(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Render a public URL to a PDF in ONE call and return the PDF bytes.
+
+        The coroutine twin of ``PdfikClient.url_to_pdf_file`` — see its
+        docstring for the full synchronous contract: ``wait: true``, 45 s
+        server budget, 503 ``SYNC_TIMEOUT`` (job cancelled, not charged, never
+        auto-resent), 422 with the job's own error code, old-server 202 JSON
+        detection, and no ``delivery`` (the response is the delivery).
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/url-to-pdf", body, idempotency_key)
+
     async def html_to_pdf(
         self,
         html: str,
@@ -686,6 +1059,36 @@ class AsyncPdfikClient:
         res = await self._request("POST", "/html-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    async def html_to_pdf_file(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        einvoice: Optional[EInvoiceOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Render raw HTML to a PDF in ONE call and return the PDF bytes.
+
+        The coroutine twin of ``PdfikClient.html_to_pdf_file``; the synchronous
+        contract is described on ``PdfikClient.url_to_pdf_file``.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if einvoice:
+            body["einvoice"] = _to_dict(einvoice)
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/html-to-pdf", body, idempotency_key)
+
     async def markdown_to_pdf(
         self,
         markdown: str,
@@ -725,6 +1128,33 @@ class AsyncPdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/markdown-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    async def markdown_to_pdf_file(
+        self,
+        markdown: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[PdfOptions] = None,
+        render: Optional[RenderOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Convert Markdown to a PDF in ONE call and return the PDF bytes.
+
+        The coroutine twin of ``PdfikClient.markdown_to_pdf_file``; the
+        synchronous contract is described on ``PdfikClient.url_to_pdf_file``.
+        """
+        body = {"markdown": markdown}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/markdown-to-pdf", body, idempotency_key)
 
     async def url_to_image(
         self,
@@ -770,6 +1200,37 @@ class AsyncPdfikClient:
         res = await self._request("POST", "/url-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
 
+    async def url_to_image_file(
+        self,
+        url: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        auth: Optional[JobAuthOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Capture a public URL as an image in ONE call and return the raw
+        PNG or JPEG bytes.
+
+        The coroutine twin of ``PdfikClient.url_to_image_file``; the
+        synchronous contract is described on ``PdfikClient.url_to_pdf_file``.
+        """
+        body = {"url": url}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if auth:
+            body["auth"] = _to_dict(auth)
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/url-to-image", body, idempotency_key)
+
     async def html_to_image(
         self,
         html: str,
@@ -809,6 +1270,34 @@ class AsyncPdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/html-to-image", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    async def html_to_image_file(
+        self,
+        html: str,
+        *,
+        webhook_url: Optional[str] = None,
+        options: Optional[ImageOptions] = None,
+        render: Optional[RenderOptions] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Capture raw HTML as an image in ONE call and return the raw PNG or
+        JPEG bytes.
+
+        The coroutine twin of ``PdfikClient.html_to_image_file``; the
+        synchronous contract is described on ``PdfikClient.url_to_pdf_file``.
+        """
+        body = {"html": html}
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if options:
+            body["options"] = _to_dict(options)
+        if render:
+            body["render"] = _to_dict(render)
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/html-to-image", body, idempotency_key)
 
     async def einvoice_to_pdf(
         self,
@@ -863,6 +1352,35 @@ class AsyncPdfikClient:
         extra_headers = _idempotency_header(idempotency_key)
         res = await self._request("POST", "/einvoice-to-pdf", json_data=body, extra_headers=extra_headers)
         return JobCreatedResponse.from_dict(res.json())
+
+    async def einvoice_to_pdf_file(
+        self,
+        xml: str,
+        *,
+        profile: EInvoiceProfile = EInvoiceProfile.EN16931,
+        template_id: Optional[str] = None,
+        template: Optional[dict] = None,
+        webhook_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        test: Optional[bool] = None
+    ) -> bytes:
+        """Build a Factur-X e-invoice in ONE call and return the PDF/A-3 bytes.
+
+        The coroutine twin of ``PdfikClient.einvoice_to_pdf_file`` (including
+        the ``X-PDFik-Warning`` note there); the synchronous contract is
+        described on ``PdfikClient.url_to_pdf_file``.
+        """
+        body = {"xml": xml, "profile": _to_dict(profile)}
+        if template_id:
+            body["template_id"] = template_id
+        if template:
+            body["template"] = template
+        if webhook_url:
+            body["webhook_url"] = webhook_url
+        if test:
+            body["test"] = True
+
+        return await self._request_file("/einvoice-to-pdf", body, idempotency_key)
 
     async def get_job(self, job_id: str) -> JobStatusResponse:
         res = await self._request("GET", f"/jobs/{job_id}")

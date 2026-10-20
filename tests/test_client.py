@@ -1332,3 +1332,274 @@ async def test_async_status_and_download_requests_carry_no_idempotency_key():
 
     assert idempotency_keys(status) == [None, None]
     assert idempotency_keys(download) == [None]
+
+
+# Synchronous mode (the *_file methods): the request carries wait:true and the
+# 200 answer is the file itself. A 503 SYNC_TIMEOUT, a 422 job failure and any
+# other 5xx are raised after exactly ONE request — by the time such an answer
+# arrives the held render may have finished (and been charged), so tenacity
+# must never resend — while throttle 429s are waited out under the same
+# Idempotency-Key exactly like on the create calls.
+
+SYNC_PDF = b"%PDF-1.7 sync sample"
+
+
+def sync_file_ok(content=SYNC_PDF, content_type="application/pdf", job_id="job-sync-1"):
+    return httpx.Response(
+        200,
+        headers={"Content-Type": content_type, "X-PDFik-Job-Id": job_id},
+        content=content,
+    )
+
+
+def sync_timeout_503():
+    # The RFC 7807 shape of docs/api/error-codes.mdx#sync-timeout.
+    return httpx.Response(503, json={
+        "type": "https://docs.pdfik.net/error-codes#sync-timeout",
+        "title": "Gateway Timeout - Render Did Not Finish In Time",
+        "status": 503,
+        "error": "SYNC_TIMEOUT",
+        "detail": (
+            "The render did not finish within 45 seconds. The job was cancelled and "
+            "NOT charged, and its Idempotency-Key was released, so retrying is safe. "
+            "For renders this long, submit without \"wait\" and use a webhook or "
+            "polling instead."
+        ),
+        "job_id": "job-sync-slow",
+    })
+
+
+def sync_job_failed_422(code="PAGE_TIMEOUT"):
+    return httpx.Response(422, json={
+        "type": "https://docs.pdfik.net/error-codes#job-failed",
+        "title": "Unprocessable Entity - Render Failed",
+        "status": 422,
+        "error": code,
+        "detail": f"The render failed with error code {code}.",
+        "job_id": "job-sync-failed",
+    })
+
+
+# The one-call twin of every create call in CREATE_CALLS; the idempotency-key
+# behaviour of the create methods is extended to these deliberately — except the
+# 500-resend cases, which must NOT apply here (a *_file 5xx is never resent).
+FILE_CALLS = [
+    ("/url-to-pdf", lambda client, **kw: client.url_to_pdf_file("https://example.com", **kw)),
+    ("/html-to-pdf", lambda client, **kw: client.html_to_pdf_file("<h1>Hello</h1>", **kw)),
+    ("/markdown-to-pdf", lambda client, **kw: client.markdown_to_pdf_file("# Hello", **kw)),
+    ("/url-to-image", lambda client, **kw: client.url_to_image_file("https://example.com", **kw)),
+    ("/html-to-image", lambda client, **kw: client.html_to_image_file("<h1>Hello</h1>", **kw)),
+    ("/einvoice-to-pdf", lambda client, **kw: client.einvoice_to_pdf_file(SAMPLE_CII_XML, **kw)),
+]
+FILE_IDS = [path for path, _ in FILE_CALLS]
+
+
+@respx.mock
+def test_url_to_pdf_file_returns_the_pdf_bytes_in_one_call():
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(return_value=sync_file_ok())
+
+    client = PdfikClient(api_key="sk_test_123")
+    pdf = client.url_to_pdf_file("https://example.com", options=PdfOptions(format="A4"))
+
+    assert pdf == SYNC_PDF
+    assert route.call_count == 1
+    request = route.calls[0].request
+    assert request.headers["X-API-Key"] == "sk_test_123"
+    assert is_uuid4(request.headers["Idempotency-Key"])
+
+    import json
+    body = json.loads(request.read())
+    assert body == {
+        "url": "https://example.com",
+        "options": {"format": "A4"},
+        "wait": True,
+    }
+
+
+@respx.mock
+def test_sync_timeout_is_raised_after_exactly_one_request(sleeps):
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(return_value=sync_timeout_503())
+
+    client = PdfikClient(api_key="sk_test_123")
+    with pytest.raises(PdfikError) as exc_info:
+        client.url_to_pdf_file("https://example.com")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "SYNC_TIMEOUT"
+    # A 503 is >= 500, so the tenacity-decorated path would resend it twice
+    # more — against a job the server has already cancelled. Exactly one
+    # request, no waits: retrying is the CALLER's decision.
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@respx.mock
+def test_sync_file_is_not_resent_after_a_500(sleeps):
+    # Unlike every other call: when a 5xx reaches the client, the held render
+    # may have finished and been charged, and there is no job id in hand to
+    # deduplicate a resend against.
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(
+        return_value=httpx.Response(500, text="Internal Server Error")
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    with pytest.raises(PdfikError) as exc_info:
+        client.url_to_pdf_file("https://example.com")
+
+    assert exc_info.value.status_code == 500
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@respx.mock
+def test_sync_file_waits_out_a_rate_limit_429_under_the_same_key(sleeps):
+    route = respx.post("https://api.pdfik.net/url-to-pdf")
+    route.side_effect = [rate_limited(4), sync_file_ok()]
+
+    client = PdfikClient(api_key="sk_test_123")
+    assert client.url_to_pdf_file("https://example.com") == SYNC_PDF
+
+    assert sleeps == [4]
+    assert route.call_count == 2
+    first, second = route.calls[0].request, route.calls[1].request
+    assert second.read() == first.read()
+    assert second.headers["Idempotency-Key"] == first.headers["Idempotency-Key"]
+    assert is_uuid4(first.headers["Idempotency-Key"])
+
+
+@respx.mock
+def test_old_server_202_json_is_an_error_naming_the_job_not_file_bytes():
+    # An old server ignores `wait` and answers the plain 202: returning that
+    # JSON as "the PDF" would save a corrupt file nobody notices until a
+    # reader chokes on it. The job was still created, so the error names it.
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(
+        return_value=httpx.Response(202, json=JOB_QUEUED)
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    with pytest.raises(PdfikError) as exc_info:
+        client.url_to_pdf_file("https://example.com")
+
+    assert route.call_count == 1
+    assert "job-123" in str(exc_info.value)
+    assert "wait" in str(exc_info.value)
+
+
+@respx.mock
+def test_sync_render_failure_carries_the_jobs_own_error_code(sleeps):
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(
+        return_value=sync_job_failed_422("PAGE_TIMEOUT")
+    )
+
+    client = PdfikClient(api_key="sk_test_123")
+    with pytest.raises(PdfikError) as exc_info:
+        client.url_to_pdf_file("https://example.com")
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.error_code == "PAGE_TIMEOUT"
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@respx.mock
+def test_sync_file_request_carries_its_own_long_timeout():
+    # The clients are built with httpx's defaults (5 s of read timeout):
+    # without a per-request override, every held request would die long
+    # before the server's 45 s budget.
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(return_value=sync_file_ok())
+
+    client = PdfikClient(api_key="sk_test_123")
+    client.url_to_pdf_file("https://example.com")
+
+    timeout = route.calls[0].request.extensions["timeout"]
+    assert timeout["read"] == 70.0
+    assert timeout["connect"] == 10.0
+
+
+@pytest.mark.parametrize("path, create_file", FILE_CALLS, ids=FILE_IDS)
+@respx.mock
+def test_every_file_method_sends_wait_true_and_its_own_idempotency_key(path, create_file):
+    route = respx.post("https://api.pdfik.net" + path).mock(return_value=sync_file_ok())
+
+    client = PdfikClient(api_key="sk_test_123")
+    assert create_file(client) == SYNC_PDF
+    assert create_file(client) == SYNC_PDF
+
+    import json
+    for call in route.calls:
+        body = json.loads(call.request.read())
+        assert body["wait"] is True
+        # The response IS the delivery, so the *_file methods take no
+        # `delivery` kwarg and must never put one on the wire.
+        assert "delivery" not in body
+    first, second = idempotency_keys(route)
+    assert is_uuid4(first) and is_uuid4(second)
+    assert first != second
+
+
+@pytest.mark.parametrize("path, create_file", FILE_CALLS, ids=FILE_IDS)
+@respx.mock
+def test_file_caller_idempotency_key_is_sent_unchanged_on_a_throttle_resend(sleeps, path, create_file):
+    route = respx.post("https://api.pdfik.net" + path)
+    route.side_effect = [rate_limited(4), sync_file_ok()]
+
+    client = PdfikClient(api_key="sk_test_123")
+    assert create_file(client, idempotency_key="order-42:invoice_7.v1") == SYNC_PDF
+
+    assert sleeps == [4]
+    assert idempotency_keys(route) == ["order-42:invoice_7.v1"] * 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_url_to_pdf_file_returns_the_pdf_bytes_in_one_call():
+    route = respx.post("https://api.pdfik.net/url-to-pdf").mock(return_value=sync_file_ok())
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        pdf = await client.url_to_pdf_file("https://example.com")
+
+    assert pdf == SYNC_PDF
+    assert route.call_count == 1
+    request = route.calls[0].request
+    assert is_uuid4(request.headers["Idempotency-Key"])
+
+    import json
+    body = json.loads(request.read())
+    assert body == {"url": "https://example.com", "wait": True}
+    timeout = request.extensions["timeout"]
+    assert timeout["read"] == 70.0
+    assert timeout["connect"] == 10.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_sync_timeout_is_raised_after_exactly_one_request(sleeps):
+    route = respx.post("https://api.pdfik.net/html-to-pdf").mock(return_value=sync_timeout_503())
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        with pytest.raises(PdfikError) as exc_info:
+            await client.html_to_pdf_file("<h1>Hello</h1>")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "SYNC_TIMEOUT"
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_sync_file_waits_out_a_rate_limit_429_under_the_same_key(sleeps):
+    route = respx.post("https://api.pdfik.net/url-to-image")
+    route.side_effect = [
+        rate_limited(3),
+        sync_file_ok(content=b"\x89PNG sample", content_type="image/png"),
+    ]
+
+    async with AsyncPdfikClient(api_key="sk_test_123") as client:
+        assert await client.url_to_image_file("https://example.com") == b"\x89PNG sample"
+
+    assert sleeps == [3]
+    assert route.call_count == 2
+    first, second = idempotency_keys(route)
+    assert is_uuid4(first)
+    assert second == first

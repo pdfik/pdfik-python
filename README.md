@@ -1,17 +1,18 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-12).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
-Official Python SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
+Official Python SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
 
-Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
+One call turns a public URL or raw HTML into a PDF (or a screenshot) and returns the file bytes. For batches and long renders the same endpoints also run asynchronously: submit, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
 
 ## Features
 
+- **One call, one file**: `url_to_pdf_file`, `html_to_pdf_file`, `markdown_to_pdf_file`, `url_to_image_file`, `html_to_image_file` and `einvoice_to_pdf_file` (on both clients) hold the request while the render runs — up to 45 seconds — and return the output bytes directly. No polling, no webhook.
 - **Type Safety**: Type hints for all options and response objects.
 - **Sync & Async**: Exposes both `PdfikClient` and `AsyncPdfikClient` using the modern `httpx` engine.
-- **Auto Retry**: `5xx` and connection errors are retried with exponential backoff (powered by `tenacity`). A rate-limit or concurrency-limit `429` is waited out for the time the API states (at most 60 s, up to five times in a row) on every call — create, status, download — not only while polling, and so is a busy file on `download_pdf`. Every other `429` (byte quota, test-mode caps, exhausted download attempts) is raised at once.
+- **Auto Retry**: `5xx` and connection errors are retried with exponential backoff (powered by `tenacity`). A rate-limit or concurrency-limit `429` is waited out for the time the API states (at most 60 s, up to five times in a row) on every call — create, status, download — not only while polling, and so is a busy file on `download_pdf`. Every other `429` (byte quota, test-mode caps, exhausted download attempts) is raised at once. The one-call `*_file` methods are the deliberate exception to the `5xx` rule: they never resend after a `5xx` or a dropped connection — in particular, a `504` `SYNC_TIMEOUT` means the job was cancelled and nothing was charged, so retrying is safe but it is your call, not the SDK's. Throttle `429`s are waited out on them like everywhere else.
 - **No duplicate jobs**: every create call carries an `Idempotency-Key` header — the `idempotency_key=` you pass, or a random UUID generated once per call and repeated on every resend — so a retried create returns the original job instead of making (and billing) a second one.
 - **DX Affordances**: Built-in polling logic (`wait_for_job`) and file download helpers.
 
@@ -23,7 +24,29 @@ pip install pdfik
 
 ## Quick Start
 
-### Convert public URL to PDF (Sync)
+### One call: URL to PDF
+
+```python
+from pdfik import PdfikClient
+
+client = PdfikClient(api_key="sk_live_...")
+
+# The request is held while the page renders (up to 45 seconds)
+# and the response is the PDF itself.
+pdf = client.url_to_pdf_file("https://example.com")
+
+with open("output.pdf", "wb") as f:
+    f.write(pdf)
+print("PDF saved to output.pdf")
+
+client.close()
+```
+
+Every job-creating method has a `*_file` twin (`html_to_pdf_file`, `markdown_to_pdf_file`, `url_to_image_file`, `html_to_image_file`, `einvoice_to_pdf_file`, sync and async) taking the same arguments except `delivery` — the response already is the delivery. If the render does not finish within 45 seconds, the call raises `PdfikError` with `error_code == "SYNC_TIMEOUT"` ([sync-timeout](https://docs.pdfik.net/error-codes#sync-timeout)): the job was cancelled and **not charged**, so calling again is safe — or submit the job asynchronously (below), which has no 45-second ceiling. A failed render raises the job's own error code (`PAGE_TIMEOUT`, `SSRF_BLOCKED`, …; [job-failed](https://docs.pdfik.net/error-codes#job-failed)).
+
+### The asynchronous flow: batches and webhooks
+
+For many documents at once, or pages that may take longer than 45 seconds, submit the job and pick the file up when it is ready — through a webhook or by polling:
 
 ```python
 from pdfik import PdfikClient, PdfOptions, MarginOptions

@@ -4,6 +4,53 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-10-20
+
+The synchronous-mode release: one call in, the file out. Everything that exists runs
+unchanged — the new methods sit next to the job-creating ones, they do not replace them.
+
+### Added
+- `url_to_pdf_file`, `html_to_pdf_file`, `markdown_to_pdf_file`, `url_to_image_file`,
+  `html_to_image_file` and `einvoice_to_pdf_file` on both `PdfikClient` and
+  `AsyncPdfikClient`. Each takes the same keyword arguments as its job-creating sibling
+  except `delivery` (the response already is the delivery), sends the request with
+  `"wait": true` and returns the output **bytes** — PDF, PNG or JPEG — in one call,
+  with no polling and no webhook. The API holds the request for up to 45 seconds; the
+  client gives the whole exchange its own 70-second per-request budget (10 s to
+  connect), independent of the clients' default timeout, which would otherwise cut a
+  held request off after 5 seconds. The file also stays downloadable for the normal
+  24 h under the job id named by the `X-PDFik-Job-Id` response header.
+- When the render does not finish inside the 45-second budget, the API answers `503`
+  ([sync-timeout](https://docs.pdfik.net/error-codes#sync-timeout)) and the method
+  raises `PdfikError` with `error_code` `SYNC_TIMEOUT` **without resending the
+  request**: the job was cancelled and not charged, and its `Idempotency-Key` was
+  released, so calling the method again is safe — but it is deliberately your call,
+  not the SDK's. More generally, a `*_file` request is never resent after a `5xx` or
+  a dropped connection (unlike every other call): by the time such an answer arrives
+  the held render may have finished and been charged, and there is no job id in hand
+  to deduplicate a resend against. Rate-limit and concurrency `429`s are still waited
+  out exactly as on the create methods, under one `Idempotency-Key` per call.
+- A failed render answers `422`
+  ([job-failed](https://docs.pdfik.net/error-codes#job-failed)) and raises `PdfikError`
+  whose `error_code` is the job's own code (`PAGE_TIMEOUT`, `SSRF_BLOCKED`,
+  `FILE_TOO_LARGE`, …), after exactly one request.
+- Old-server detection: a server that does not know `wait` ignores it and answers the
+  ordinary `202` JSON. The `*_file` methods detect that (a `202`, or JSON on any `2xx`)
+  and raise `PdfikError` (`SYNC_MODE_UNSUPPORTED`) naming the created job's id instead
+  of handing the JSON back as file bytes — that job renders normally and can still be
+  fetched with `wait_for_job` + `download_pdf`.
+- README: the quick start now opens with the one-call flow; the asynchronous
+  submit/poll/webhook flow stays below for batches and renders that may take longer
+  than 45 seconds.
+- Tests: the one-call happy path (sync and async), `SYNC_TIMEOUT` and a plain `500`
+  raised after exactly one request, the job's own error code on `422`, the old-server
+  `202` detection, the 70 s per-request timeout on the wire, and — for all six
+  methods — `wait: true` on the wire, no `delivery` field, and the same
+  `Idempotency-Key` across a throttle resend.
+
+### Changed
+- Version `0.4.2` → `0.5.0` (`pyproject.toml`).
+
 ## [0.4.2] — 2026-10-12
 
 A bug-fix release: no new options and no signature changes. Code written against 0.4.1
