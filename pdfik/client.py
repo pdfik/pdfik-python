@@ -526,7 +526,7 @@ class PdfikClient:
         image jobs the download returns ``image/png`` or ``image/jpeg``
         instead of a PDF.
 
-        ``auth`` (Pro+) attaches basic/bearer credentials exactly as on
+        ``auth`` attaches basic/bearer credentials exactly as on
         ``url_to_pdf``. ``delivery`` and ``test`` behave as on the PDF
         endpoints and cannot be combined with each other.
         """
@@ -1178,7 +1178,7 @@ class AsyncPdfikClient:
         image jobs the download returns ``image/png`` or ``image/jpeg``
         instead of a PDF.
 
-        ``auth`` (Pro+) attaches basic/bearer credentials exactly as on
+        ``auth`` attaches basic/bearer credentials exactly as on
         ``url_to_pdf``. ``delivery`` and ``test`` behave as on the PDF
         endpoints and cannot be combined with each other.
         """

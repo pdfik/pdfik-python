@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-02).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -160,7 +160,7 @@ image_bytes = client.download_pdf(job.job_id)  # JPEG bytes
 shot = client.html_to_image("<h1>Hello</h1>")  # 1024x768 PNG
 ```
 
-`url_to_image` also accepts the Pro+ `auth` option (basic/bearer), exactly as `url_to_pdf`. Passing `quality` together with PNG is rejected with `422`.
+`url_to_image` also accepts the `auth` option (basic/bearer), exactly as `url_to_pdf`. Passing `quality` together with PNG is rejected with `422`.
 
 ### Deliver to your own bucket (BYOB)
 

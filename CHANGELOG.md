@@ -4,6 +4,15 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-11-01
+
+No code changes.
+
+### Changed
+- Supported Python is now **3.13+** — the latest stable interpreter with current
+  security fixes, the same version the PDFik platform itself runs on. Older
+  interpreters (3.8–3.12) are no longer promised or tested; on 3.13 nothing changes.
+
 ## [0.5.0] — 2026-10-20
 
 The synchronous-mode release: one call in, the file out. Everything that exists runs

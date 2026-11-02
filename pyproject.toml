@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdfik"
-version = "0.5.0"
+version = "0.6.0"
 description = "Official Python SDK for the PDFik PDF generation API"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.13"
 license = {text = "MIT"}
 authors = [
     {name = "PDFik", email = "support@pdfik.net"}
