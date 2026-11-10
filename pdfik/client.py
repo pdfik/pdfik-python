@@ -46,6 +46,37 @@ _SYNC_WAIT_TIMEOUT = httpx.Timeout(70.0, connect=10.0)
 def _is_retryable_exception(exception: BaseException) -> bool:
     return isinstance(exception, PdfikError) and exception.status_code >= 500
 
+def _network_error(exc: httpx.RequestError) -> PdfikError:
+    """A request that got no HTTP answer, or whose connection broke while the body
+    was being read (httpx reads the whole body inside ``request()``): status 503 and
+    the code ``NETWORK_ERROR``, as in the other PDFik SDKs. Being a 503, it is resent
+    like a 5xx answer by the tenacity-decorated calls and raised at once by the
+    ``*_file`` calls."""
+    return PdfikError(f"Connection failed: {exc}", 503, "NETWORK_ERROR")
+
+# What httpx refuses to send is the caller's input, not a network failure: a header
+# value HTTP forbids — a line break, a NUL, or a leading or trailing space in the API
+# key or idempotency_key (LocalProtocolError, raised before a byte of the request
+# goes out) — or a URL whose scheme is not http(s) (UnsupportedProtocol). Both are
+# RequestErrors, so they are named here and raised unchanged, at once: never
+# NETWORK_ERROR, never resent. (httpx.InvalidURL, and the UnicodeEncodeError of a
+# non-ASCII header value, are not RequestErrors and propagate on their own.)
+_NOT_SENT = (httpx.LocalProtocolError, httpx.UnsupportedProtocol)
+
+def _checked_base_url(base_url: str) -> str:
+    """``base_url`` without its trailing slash, refused at once unless it is an
+    absolute http(s) URL — otherwise every call would fail on its own, later."""
+    stripped = base_url.rstrip("/")
+    refusal = f"base_url must be an absolute http(s) URL such as https://api.pdfik.net, not {base_url!r}"
+    try:
+        url = httpx.URL(stripped)
+    except httpx.InvalidURL as exc:
+        raise ValueError(refusal) from exc
+    # httpx reads "localhost:8000" as scheme "localhost", and "api.pdfik.net" as a path.
+    if url.scheme not in ("http", "https") or not url.host:
+        raise ValueError(refusal)
+    return stripped
+
 def _idempotency_header(idempotency_key: Optional[str]) -> dict:
     # Built once per create call, outside _request: _request runs again for every
     # resend, and a resend must carry the key of the first attempt — the API then
@@ -162,7 +193,7 @@ class PdfikClient:
         if not api_key:
             raise ValueError("API key is required")
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _checked_base_url(base_url)
         self.client = httpx.Client()
 
     @retry(
@@ -183,8 +214,10 @@ class PdfikClient:
         while True:
             try:
                 response = self.client.request(method, url, headers=headers, json=json_data)
+            except _NOT_SENT:
+                raise
             except httpx.RequestError as exc:
-                raise PdfikError(f"Connection failed: {exc}", 503)
+                raise _network_error(exc)
 
             if not response.is_error:
                 return response
@@ -224,8 +257,10 @@ class PdfikClient:
         while True:
             try:
                 response = self.client.request(method, url, headers=headers, json=json_data, timeout=_SYNC_WAIT_TIMEOUT)
+            except _NOT_SENT:
+                raise
             except httpx.RequestError as exc:
-                raise PdfikError(f"Connection failed: {exc}", 503)
+                raise _network_error(exc)
 
             if not response.is_error:
                 return response
@@ -815,7 +850,19 @@ class PdfikClient:
 
     @staticmethod
     def verify_webhook_signature(raw_body: bytes, headers: dict, secret: str) -> bool:
-        headers_lower = {k.lower(): v for k, v in headers.items()}
+        """Verify a webhook delivery against your webhook secret.
+
+        ``X-PDFik-Signature`` is ``t=<unix seconds>,v1=<hex HMAC-SHA256 of
+        "<t>.<raw body>">`` and ``t`` must be within ±300 s of now. While a
+        rotated-out secret is still inside its overlap window the header carries
+        one ``v1`` per secret (``t=…,v1=<new>,v1=<previous>``), so every ``v1`` is
+        checked and the delivery is genuine if ANY of them matches ``secret``.
+        Pass the raw body bytes exactly as received, never re-serialized JSON.
+        A missing or non-mapping ``headers`` is an unverified delivery: ``False``.
+        """
+        if not hasattr(headers, "items"):
+            return False
+        headers_lower = {str(k).lower(): v for k, v in headers.items()}
         signature_header = headers_lower.get("x-pdfik-signature")
         timestamp_header = headers_lower.get("x-pdfik-timestamp")
 
@@ -823,11 +870,16 @@ class PdfikClient:
             return False
 
         try:
-            parts = dict(p.split("=", 1) for p in signature_header.split(","))
-            timestamp = parts.get("t")
-            received_sig = parts.get("v1")
+            timestamp = None
+            received_sigs = []
+            for part in signature_header.split(","):
+                key, value = part.split("=", 1)  # a part without "=" raises: header rejected
+                if key == "t":
+                    timestamp = value
+                elif key == "v1" and value:
+                    received_sigs.append(value)
 
-            if not timestamp or not received_sig:
+            if not timestamp or not received_sigs:
                 return False
 
             now = int(time.time())
@@ -837,9 +889,15 @@ class PdfikClient:
             signed_payload = f"{timestamp}.{raw_body.decode('utf-8')}".encode("utf-8")
             expected_sig = hmac.new(
                 secret.encode("utf-8"), signed_payload, hashlib.sha256
-            ).hexdigest()
+            ).hexdigest().encode("ascii")
 
-            return hmac.compare_digest(expected_sig, received_sig)
+            # Every candidate is compared, each in constant time (as bytes, so one
+            # non-ASCII value cannot raise and hide a match among the others).
+            matched = False
+            for received_sig in received_sigs:
+                if hmac.compare_digest(expected_sig, received_sig.encode("utf-8")):
+                    matched = True
+            return matched
         except Exception:
             return False
 
@@ -850,7 +908,7 @@ class AsyncPdfikClient:
         if not api_key:
             raise ValueError("API key is required")
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _checked_base_url(base_url)
         self.client = httpx.AsyncClient()
 
     @retry(
@@ -871,8 +929,10 @@ class AsyncPdfikClient:
         while True:
             try:
                 response = await self.client.request(method, url, headers=headers, json=json_data)
+            except _NOT_SENT:
+                raise
             except httpx.RequestError as exc:
-                raise PdfikError(f"Connection failed: {exc}", 503)
+                raise _network_error(exc)
 
             if not response.is_error:
                 return response
@@ -900,8 +960,10 @@ class AsyncPdfikClient:
         while True:
             try:
                 response = await self.client.request(method, url, headers=headers, json=json_data, timeout=_SYNC_WAIT_TIMEOUT)
+            except _NOT_SENT:
+                raise
             except httpx.RequestError as exc:
-                raise PdfikError(f"Connection failed: {exc}", 503)
+                raise _network_error(exc)
 
             if not response.is_error:
                 return response

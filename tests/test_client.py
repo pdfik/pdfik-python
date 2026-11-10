@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import time
 import uuid
 
@@ -600,6 +602,76 @@ def test_verify_webhook_signature():
 
     # Test missing headers
     assert PdfikClient.verify_webhook_signature(raw_body, {}, secret) is False
+
+    # No headers at all (a framework handing over None) is unverified, not a crash -
+    # the JS, Java and C# helpers already return false here.
+    assert PdfikClient.verify_webhook_signature(raw_body, None, secret) is False
+    assert PdfikClient.verify_webhook_signature(raw_body, "X-PDFik-Signature: t=1,v1=00", secret) is False
+
+
+ROTATION_BODY = b'{"job_id":"j-1","status":"done","test":false}'
+CURRENT_SECRET = "whsec_current"
+PREVIOUS_SECRET = "whsec_previous"
+
+
+def _webhook_sign(secret, timestamp, raw_body=ROTATION_BODY):
+    return hmac.new(secret.encode(), timestamp.encode() + b"." + raw_body, hashlib.sha256).hexdigest()
+
+
+def _webhook_headers(signature, timestamp):
+    return {"X-PDFik-Signature": signature, "X-PDFik-Timestamp": timestamp}
+
+
+def _rotation_signature(timestamp):
+    # What a delivery carries while the previous secret is inside its overlap
+    # window: one v1 per secret, the current secret's first.
+    return "t=%s,v1=%s,v1=%s" % (
+        timestamp,
+        _webhook_sign(CURRENT_SECRET, timestamp),
+        _webhook_sign(PREVIOUS_SECRET, timestamp),
+    )
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [CURRENT_SECRET, PREVIOUS_SECRET],
+    ids=["receiver-on-the-current-secret-matches-the-first-v1", "receiver-on-the-previous-secret-matches-the-second-v1"],
+)
+def test_verify_webhook_signature_accepts_either_signature_of_a_rotation_window(secret):
+    # The helper used to keep only the LAST v1 (the previous secret's), so a
+    # receiver already switched to the new secret rejected every delivery.
+    now = str(int(time.time()))
+    headers = _webhook_headers(_rotation_signature(now), now)
+    assert PdfikClient.verify_webhook_signature(ROTATION_BODY, headers, secret) is True
+
+
+def test_verify_webhook_signature_rejects_two_signatures_matching_neither_secret():
+    now = str(int(time.time()))
+    headers = _webhook_headers(_rotation_signature(now), now)
+    assert PdfikClient.verify_webhook_signature(ROTATION_BODY, headers, "whsec_unrelated") is False
+
+
+def test_verify_webhook_signature_keeps_the_300_second_window_for_every_signature():
+    stale = str(int(time.time()) - 400)
+    headers = _webhook_headers(_rotation_signature(stale), stale)
+    assert PdfikClient.verify_webhook_signature(ROTATION_BODY, headers, CURRENT_SECRET) is False
+    assert PdfikClient.verify_webhook_signature(ROTATION_BODY, headers, PREVIOUS_SECRET) is False
+
+
+def test_verify_webhook_signature_rejects_malformed_headers():
+    now = str(int(time.time()))
+    current = _webhook_sign(CURRENT_SECRET, now)
+    previous = _webhook_sign(PREVIOUS_SECRET, now)
+    for signature in (
+        "v1=%s,v1=%s" % (current, previous),  # no t
+        "t=%s" % now,  # no v1
+        "t=%s,v1=,v1=" % now,  # empty v1 values
+        "garbage",
+        "t=soon,v1=%s" % _webhook_sign(CURRENT_SECRET, "soon"),  # signed, but t is not a number
+    ):
+        headers = _webhook_headers(signature, now)
+        assert PdfikClient.verify_webhook_signature(ROTATION_BODY, headers, CURRENT_SECRET) is False, signature
+
 
 def test_job_auth_options_is_importable_from_the_package_root():
     # `auth=` is a public parameter, so its type must come from where users import
@@ -1603,3 +1675,163 @@ async def test_async_sync_file_waits_out_a_rate_limit_429_under_the_same_key(sle
     first, second = idempotency_keys(route)
     assert is_uuid4(first)
     assert second == first
+
+
+# A connection failure — no HTTP answer at all, or a connection that breaks while
+# the body is being read — is a PdfikError with status 503 and the code
+# NETWORK_ERROR, as in the JavaScript, Java and C# clients. The ordinary calls
+# resend it like a 5xx (a resent create keeps its Idempotency-Key); the *_file
+# calls never resend it. These clients point at 127.0.0.1 and respx answers every
+# request, so nothing leaves the machine.
+
+LOCAL_API = "http://127.0.0.1:9"
+
+
+class _BodyBreaksOff(httpx.SyncByteStream):
+    """A body whose connection drops after the first chunk, as httpx reports it."""
+
+    def __iter__(self):
+        yield b"%PDF-1.7 part"
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+class _AsyncBodyBreaksOff(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"%PDF-1.7 part"
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def body_breaks_off(request):
+    return httpx.Response(200, headers={"Content-Type": "application/pdf"}, stream=_BodyBreaksOff())
+
+
+def async_body_breaks_off(request):
+    return httpx.Response(200, headers={"Content-Type": "application/pdf"}, stream=_AsyncBodyBreaksOff())
+
+
+@respx.mock
+def test_connection_failure_is_a_network_error_resent_like_a_5xx(sleeps):
+    route = respx.get(LOCAL_API + "/jobs/job-123").mock(side_effect=httpx.ConnectError("Connection refused"))
+
+    client = PdfikClient(api_key="sk_test_123", base_url=LOCAL_API)
+    with pytest.raises(PdfikError) as exc_info:
+        client.get_job("job-123")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "NETWORK_ERROR"
+    assert str(exc_info.value) == "Connection failed: Connection refused (HTTP 503) [NETWORK_ERROR]"
+    assert route.call_count == 3
+    assert sleeps == [1, 2]
+
+
+@respx.mock
+def test_download_whose_body_breaks_off_is_a_network_error_resent_like_a_5xx(sleeps):
+    route = respx.get(LOCAL_API + "/jobs/job-123/download").mock(side_effect=body_breaks_off)
+
+    client = PdfikClient(api_key="sk_test_123", base_url=LOCAL_API)
+    with pytest.raises(PdfikError) as exc_info:
+        client.download_pdf("job-123")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "NETWORK_ERROR"
+    assert route.call_count == 3
+    assert sleeps == [1, 2]
+
+
+@respx.mock
+def test_sync_file_whose_body_breaks_off_is_a_network_error_and_never_resent(sleeps):
+    # The render already ran, and was charged, when its file stopped arriving.
+    route = respx.post(LOCAL_API + "/url-to-pdf").mock(side_effect=body_breaks_off)
+
+    client = PdfikClient(api_key="sk_test_123", base_url=LOCAL_API)
+    with pytest.raises(PdfikError) as exc_info:
+        client.url_to_pdf_file("https://example.com")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "NETWORK_ERROR"
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_create_connection_failure_is_a_network_error_resent_under_one_key(sleeps):
+    route = respx.post(LOCAL_API + "/url-to-pdf").mock(side_effect=httpx.ConnectError("Connection refused"))
+
+    async with AsyncPdfikClient(api_key="sk_test_123", base_url=LOCAL_API) as client:
+        with pytest.raises(PdfikError) as exc_info:
+            await client.url_to_pdf("https://example.com")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "NETWORK_ERROR"
+    assert route.call_count == 3
+    assert sleeps == [1, 2]
+    first, second, third = idempotency_keys(route)
+    assert is_uuid4(first)
+    assert second == third == first
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_sync_file_whose_body_breaks_off_is_a_network_error_and_never_resent(sleeps):
+    route = respx.post(LOCAL_API + "/html-to-pdf").mock(side_effect=async_body_breaks_off)
+
+    async with AsyncPdfikClient(api_key="sk_test_123", base_url=LOCAL_API) as client:
+        with pytest.raises(PdfikError) as exc_info:
+            await client.html_to_pdf_file("<h1>Hello</h1>")
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.error_code == "NETWORK_ERROR"
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+# A configuration error is the caller's to fix, never a NETWORK_ERROR.
+
+
+def test_base_url_that_is_not_an_absolute_http_url_is_refused_by_the_constructor():
+    # Every call would otherwise fail with httpx's UnsupportedProtocol, a RequestError:
+    # a NETWORK_ERROR, resent twice. httpx reads "localhost:8000" as scheme "localhost".
+    for client_class in (PdfikClient, AsyncPdfikClient):
+        for base_url in ("api.pdfik.net", "localhost:8000", "ftp://api.pdfik.net", "https://"):
+            with pytest.raises(ValueError, match=r"^base_url must be an absolute http\(s\) URL"):
+                client_class(api_key="sk_test_123", base_url=base_url)
+    with PdfikClient(api_key="sk_test_123", base_url=LOCAL_API + "/") as client:
+        assert client.base_url == LOCAL_API
+
+
+# httpx refuses to send a header value HTTP forbids (h11: a line break, a NUL, a
+# leading or trailing space) as LocalProtocolError — a RequestError like a refused
+# connection, but raised before a byte of the request goes out. respx stands in for
+# the transport that raises it.
+
+
+@pytest.mark.parametrize("call", ["url_to_pdf", "url_to_pdf_file"])
+@respx.mock
+def test_header_value_httpx_refuses_to_send_is_raised_at_once_not_as_a_network_error(sleeps, call):
+    route = respx.post(LOCAL_API + "/url-to-pdf").mock(
+        side_effect=httpx.LocalProtocolError("Illegal header value b'order\\r\\n42'")
+    )
+
+    client = PdfikClient(api_key="sk_test_123", base_url=LOCAL_API)
+    with pytest.raises(httpx.LocalProtocolError):
+        getattr(client, call)("https://example.com", idempotency_key="order\r\n42")
+
+    assert route.call_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", ["url_to_pdf", "url_to_pdf_file"])
+@respx.mock
+async def test_async_header_value_httpx_refuses_to_send_is_raised_at_once_not_as_a_network_error(sleeps, call):
+    route = respx.post(LOCAL_API + "/url-to-pdf").mock(
+        side_effect=httpx.LocalProtocolError("Illegal header value b'order\\r\\n42'")
+    )
+
+    async with AsyncPdfikClient(api_key="sk_test_123", base_url=LOCAL_API) as client:
+        with pytest.raises(httpx.LocalProtocolError):
+            await getattr(client, call)("https://example.com", idempotency_key="order\r\n42")
+
+    assert route.call_count == 1
+    assert sleeps == []

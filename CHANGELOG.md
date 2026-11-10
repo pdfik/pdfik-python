@@ -4,6 +4,46 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-11-09
+
+### Fixed
+- `PdfikClient.verify_webhook_signature` checks every `v1` in `X-PDFik-Signature`. While
+  the overlap window of a secret rotation is open, PDFik signs each delivery with both
+  secrets and sends both signatures in the one header, the current secret's first:
+  `t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+  The helper now accepts the delivery if any `v1` matches the secret you pass, comparing
+  each one in constant time. Up to 0.6.0 it kept only the last `v1` — inside a window,
+  the previous secret's — so a receiver already switched to the new secret would reject
+  every genuine delivery until the window closed: upgrade before you rotate with an
+  overlap window. A header with a single `v1`, the ±300 s timestamp rule and the `bool`
+  result are unchanged.
+- A connection failure — no HTTP answer at all (DNS failure, refused or reset
+  connection, TLS error, timeout) or a connection that breaks while the body is being
+  read — now raises `PdfikError` with `error_code == "NETWORK_ERROR"` as well as
+  `status_code == 503`, the same code the JavaScript, Java and C# clients report. It
+  used to carry no `error_code`, so code that branches on the code could not tell it
+  apart from a server's own `503`. Retries are unchanged: the ordinary calls resend it
+  like a `5xx` (a resent create keeps its `Idempotency-Key`), and the `*_file` methods
+  raise it after their one attempt.
+- `verify_webhook_signature` returns `False` when `headers` is `None` or not a mapping, as
+  the JavaScript, Java and C# helpers do; it used to raise `AttributeError`.
+
+### Changed
+- `PdfikClient` and `AsyncPdfikClient` raise `ValueError` for a `base_url` that is not an
+  absolute http(s) URL (`api.pdfik.net` without `https://`, or `localhost:8000`). Up to
+  0.6.0 such a client was created and every call then failed with a `503`
+  "Connection failed: …" — the ordinary calls after three attempts, the `*_file`
+  calls after their one.
+- A header value httpx refuses to send — a line break, or a leading or trailing space, in
+  the API key or `idempotency_key` — raises httpx's own `LocalProtocolError` at once. Up
+  to 0.6.0 it became a `503` "Connection failed" that the ordinary calls resent twice,
+  although nothing had been sent; it is not a `NETWORK_ERROR`.
+- README: "Handling Webhooks" says deliveries are signed once a signing secret has been
+  generated (unsigned until then) and describes the signature header, the ±300 s rule and
+  the two signatures of a rotation window (it used to advise checking the new secret and
+  then the old one yourself); the Auto Retry line names the `NETWORK_ERROR` code.
+- Version `0.6.0` → `0.7.0` (`pyproject.toml`).
+
 ## [0.6.0] — 2026-11-01
 
 No code changes.

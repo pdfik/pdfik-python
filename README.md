@@ -1,6 +1,6 @@
 # pdfik
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-02).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-10).
 > Releases to PyPI are cut from the monorepo; issues and PRs are welcome here.
 
 Official Python SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -12,7 +12,7 @@ One call turns a public URL or raw HTML into a PDF (or a screenshot) and returns
 - **One call, one file**: `url_to_pdf_file`, `html_to_pdf_file`, `markdown_to_pdf_file`, `url_to_image_file`, `html_to_image_file` and `einvoice_to_pdf_file` (on both clients) hold the request while the render runs — up to 45 seconds — and return the output bytes directly. No polling, no webhook.
 - **Type Safety**: Type hints for all options and response objects.
 - **Sync & Async**: Exposes both `PdfikClient` and `AsyncPdfikClient` using the modern `httpx` engine.
-- **Auto Retry**: `5xx` and connection errors are retried with exponential backoff (powered by `tenacity`). A rate-limit or concurrency-limit `429` is waited out for the time the API states (at most 60 s, up to five times in a row) on every call — create, status, download — not only while polling, and so is a busy file on `download_pdf`. Every other `429` (byte quota, test-mode caps, exhausted download attempts) is raised at once. The one-call `*_file` methods are the deliberate exception to the `5xx` rule: they never resend after a `5xx` or a dropped connection — in particular, a `503` `SYNC_TIMEOUT` means the job was cancelled and nothing was charged, so retrying is safe but it is your call, not the SDK's. Throttle `429`s are waited out on them like everywhere else.
+- **Auto Retry**: `5xx` and connection errors are retried with exponential backoff (powered by `tenacity`). A connection error — no HTTP answer at all, or a connection that breaks while the body is being read — is raised as `PdfikError` with `error_code` `"NETWORK_ERROR"` and `status_code` `503`. A rate-limit or concurrency-limit `429` is waited out for the time the API states (at most 60 s, up to five times in a row) on every call — create, status, download — not only while polling, and so is a busy file on `download_pdf`. Every other `429` (byte quota, test-mode caps, exhausted download attempts) is raised at once. The one-call `*_file` methods are the deliberate exception to the `5xx` rule: they never resend after a `5xx` or a dropped connection — in particular, a `503` `SYNC_TIMEOUT` means the job was cancelled and nothing was charged, so retrying is safe but it is your call, not the SDK's. Throttle `429`s are waited out on them like everywhere else.
 - **No duplicate jobs**: every create call carries an `Idempotency-Key` header — the `idempotency_key=` you pass, or a random UUID generated once per call and repeated on every resend — so a retried create returns the original job instead of making (and billing) a second one.
 - **DX Affordances**: Built-in polling logic (`wait_for_job`) and file download helpers.
 
@@ -224,9 +224,19 @@ If you specify `webhook_url` in the options of `url_to_pdf` or `html_to_pdf`, PD
 
 You should verify the authenticity of the webhook by validating the signature. We provide a static helper `verify_webhook_signature` in `PdfikClient` for this purpose.
 
-During a secret rotation both the new and the previous secret verify for the overlap
-window you pick in the dashboard (1 hour to 5 days, or none at all), so check the new
-one first and fall back to the old one while you roll your receivers out.
+Deliveries are signed once you generate a signing secret on the dashboard's Webhooks
+page (every plan, Free included); until then — or after you delete the secret — they
+arrive without the `X-PDFik-Signature` and `X-PDFik-Timestamp` headers, and
+`verify_webhook_signature` returns `False` for them. While a secret is set, every delivery
+carries `X-PDFik-Signature: t=<unix seconds>,v1=<signature>` — the
+hex HMAC-SHA256 of `<t>.<raw body>` under your webhook secret — and `X-PDFik-Timestamp`;
+a `t` more than 300 seconds away from now is rejected. When you rotate the secret with
+an overlap window (picked in the dashboard: 1 hour to 5 days, or none at all), every
+delivery inside the window is signed with both secrets, current first:
+`t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+`verify_webhook_signature` accepts a delivery if any `v1` matches the secret you pass, so
+a receiver still holding the previous secret keeps working — switch each receiver to the
+new secret before the window closes.
 
 Custom delivery headers (e.g. a Cloudflare Access service token) are configured once on
 the dashboard Webhooks page and attached to every delivery — nothing to pass per request.
