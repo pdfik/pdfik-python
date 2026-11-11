@@ -4,6 +4,20 @@ All notable changes to `pdfik` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-11-10
+
+### Fixed
+- `verify_webhook_signature` returns `False` for an empty secret and for a `t` that is not
+  plain ASCII digits; spaces around header tokens and tokens without `=` no longer reject
+  a genuine delivery.
+- The throttle waits of one call are counted once: a `5xx` resend used to restart them
+  (up to 15 waits, about 15 minutes, in one call).
+- An API key with surrounding whitespace, a line break, a NUL or a non-ASCII character is
+  refused at construction, and the message never contains the key (httpx's error did).
+- `download_pdf` is not resent: each started stream is one of the file's three attempts.
+- The `429` volume quota held by jobs that are still running is waited out like the
+  request-rate throttle.
+
 ## [0.7.0] — 2026-11-09
 
 ### Fixed

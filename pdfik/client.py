@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import asyncio
 import hmac
@@ -77,6 +78,16 @@ def _checked_base_url(base_url: str) -> str:
         raise ValueError(refusal)
     return stripped
 
+def _check_api_key(api_key) -> None:
+    """Refused at construction, and the message never quotes the key: a value HTTP cannot
+    send in a header (a trailing newline or space, a NUL) used to fail every call with an
+    httpx error whose text contained the whole key."""
+    if not api_key or not isinstance(api_key, str):
+        raise ValueError("API key is required")
+    if api_key != api_key.strip() or any(ch in api_key for ch in "\r\n\0") or not api_key.isascii():
+        raise ValueError("API key contains whitespace, a line break or a non-ASCII character (pasted with a newline?)")
+
+
 def _idempotency_header(idempotency_key: Optional[str]) -> dict:
     # Built once per create call, outside _request: _request runs again for every
     # resend, and a resend must carry the key of the first attempt — the API then
@@ -96,8 +107,13 @@ def _is_throttled(err: PdfikError, cases: Tuple[str, ...] = _THROTTLE_CASES) -> 
     case."""
     if err.status_code != 429:
         return False
-    problem_type = str(_problem(err).get("type") or "")
+    problem = _problem(err)
+    problem_type = str(problem.get("type") or "")
     code = str(err.error_code or "").upper()
+    # The volume quota HELD by jobs still running clears by itself and says when
+    # (retry_after_seconds); a used-up volume quota carries no such field.
+    if (problem_type.endswith("#quota-bytes-exceeded") or code == "BYTE_QUOTA_EXCEEDED")             and problem.get("retry_after_seconds") is not None:
+        return True
     return any(
         problem_type.endswith("#" + case) or code == case.replace("-", "_").upper()
         for case in cases
@@ -190,11 +206,15 @@ def _sync_file_bytes(response: httpx.Response) -> bytes:
 
 class PdfikClient:
     def __init__(self, api_key: str, base_url: str = "https://api.pdfik.net"):
-        if not api_key:
-            raise ValueError("API key is required")
+        _check_api_key(api_key)
         self.api_key = api_key
         self.base_url = _checked_base_url(base_url)
         self.client = httpx.Client()
+
+    def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
+        # One throttle budget per CALL, shared by every resend tenacity makes after a 5xx:
+        # it used to restart with each attempt (up to 15 waits, ~15 minutes, in one call).
+        return self._request_attempts(method, path, json_data, extra_headers, throttle_waits, throttle_cases, [throttle_waits])
 
     @retry(
         stop=stop_after_attempt(3),
@@ -202,7 +222,7 @@ class PdfikClient:
         retry=retry_if_exception(_is_retryable_exception),
         reraise=True
     )
-    def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
+    def _request_attempts(self, method: str, path: str, json_data: Optional[dict], extra_headers: Optional[dict], throttle_waits: int, throttle_cases: Tuple[str, ...], _budget: list) -> httpx.Response:
         url = f"{self.base_url}{path}"
         headers = {
             "X-API-Key": self.api_key,
@@ -210,7 +230,6 @@ class PdfikClient:
         if extra_headers:
             headers.update(extra_headers)
 
-        waits = 0
         while True:
             try:
                 response = self.client.request(method, url, headers=headers, json=json_data)
@@ -225,12 +244,12 @@ class PdfikClient:
             error = _error_from(response)
             # A throttled request created no job and started no download stream, so
             # sending it again is safe.
-            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
+            if not _is_throttled(error, throttle_cases) or _budget[0] <= 0:
                 raise error
-            waits += 1
+            _budget[0] -= 1
             time.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
 
-    def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS) -> httpx.Response:
+    def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
         """One attempt, outside tenacity — the request path of the synchronous
         (``wait: true``) ``*_file`` methods.
 
@@ -266,7 +285,7 @@ class PdfikClient:
                 return response
 
             error = _error_from(response)
-            if not _is_throttled(error) or waits >= throttle_waits:
+            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
                 raise error
             waits += 1
             time.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
@@ -836,7 +855,9 @@ class PdfikClient:
         lives in your own bucket, at the address you presigned, and this
         endpoint answers 404.
         """
-        res = self._request("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
+        # One attempt: every started stream is one of the file's three download attempts,
+        # so a broken connection is not resent.
+        res = self._request_once("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
         return res.content
 
     def close(self):
@@ -872,14 +893,18 @@ class PdfikClient:
         try:
             timestamp = None
             received_sigs = []
+            if not secret:
+                return False
             for part in signature_header.split(","):
-                key, value = part.split("=", 1)  # a part without "=" raises: header rejected
+                if "=" not in part:
+                    continue
+                key, value = (s.strip() for s in part.split("=", 1))
                 if key == "t":
                     timestamp = value
                 elif key == "v1" and value:
                     received_sigs.append(value)
 
-            if not timestamp or not received_sigs:
+            if not timestamp or not re.fullmatch(r"[0-9]{1,20}", timestamp) or not received_sigs:
                 return False
 
             now = int(time.time())
@@ -905,11 +930,15 @@ class PdfikClient:
 
 class AsyncPdfikClient:
     def __init__(self, api_key: str, base_url: str = "https://api.pdfik.net"):
-        if not api_key:
-            raise ValueError("API key is required")
+        _check_api_key(api_key)
         self.api_key = api_key
         self.base_url = _checked_base_url(base_url)
         self.client = httpx.AsyncClient()
+
+    async def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
+        # One throttle budget per CALL, shared by every resend tenacity makes after a 5xx:
+        # it used to restart with each attempt (up to 15 waits, ~15 minutes, in one call).
+        return await self._request_attempts(method, path, json_data, extra_headers, throttle_waits, throttle_cases, [throttle_waits])
 
     @retry(
         stop=stop_after_attempt(3),
@@ -917,7 +946,7 @@ class AsyncPdfikClient:
         retry=retry_if_exception(_is_retryable_exception),
         reraise=True
     )
-    async def _request(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
+    async def _request_attempts(self, method: str, path: str, json_data: Optional[dict], extra_headers: Optional[dict], throttle_waits: int, throttle_cases: Tuple[str, ...], _budget: list) -> httpx.Response:
         url = f"{self.base_url}{path}"
         headers = {
             "X-API-Key": self.api_key,
@@ -925,7 +954,6 @@ class AsyncPdfikClient:
         if extra_headers:
             headers.update(extra_headers)
 
-        waits = 0
         while True:
             try:
                 response = await self.client.request(method, url, headers=headers, json=json_data)
@@ -939,12 +967,12 @@ class AsyncPdfikClient:
 
             error = _error_from(response)
             # Same as the sync client: a throttle is waited out and the request resent.
-            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
+            if not _is_throttled(error, throttle_cases) or _budget[0] <= 0:
                 raise error
-            waits += 1
+            _budget[0] -= 1
             await asyncio.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
 
-    async def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS) -> httpx.Response:
+    async def _request_once(self, method: str, path: str, json_data: Optional[dict] = None, extra_headers: Optional[dict] = None, throttle_waits: int = _THROTTLE_WAITS, throttle_cases: Tuple[str, ...] = _THROTTLE_CASES) -> httpx.Response:
         """One attempt, outside tenacity — same as the sync client's
         ``_request_once`` (see there for WHY a ``wait: true`` request must never
         be resent after a 5xx or a dropped connection, while throttle 429s are
@@ -969,7 +997,7 @@ class AsyncPdfikClient:
                 return response
 
             error = _error_from(response)
-            if not _is_throttled(error) or waits >= throttle_waits:
+            if not _is_throttled(error, throttle_cases) or waits >= throttle_waits:
                 raise error
             waits += 1
             await asyncio.sleep(_throttle_delay(error, _RETRY_AFTER_FALLBACK, response.headers.get("Retry-After")))
@@ -1500,7 +1528,9 @@ class AsyncPdfikClient:
         lives in your own bucket, at the address you presigned, and this
         endpoint answers 404.
         """
-        res = await self._request("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
+        # One attempt: every started stream is one of the file's three download attempts,
+        # so a broken connection is not resent.
+        res = await self._request_once("GET", f"/jobs/{job_id}/download", throttle_cases=_DOWNLOAD_THROTTLE_CASES)
         return res.content
 
     async def close(self):

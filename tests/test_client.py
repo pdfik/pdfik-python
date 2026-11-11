@@ -421,7 +421,7 @@ def test_retry_on_500(monkeypatch):
     # The retry object is shared by every client, so the patch must be undone:
     # a plain assignment switched the backoff off for all the tests after this one.
     from tenacity import wait_none
-    monkeypatch.setattr(client._request.retry, "wait", wait_none())
+    monkeypatch.setattr(client._request_attempts.retry, "wait", wait_none())
 
     with pytest.raises(PdfikError) as exc_info:
         client.get_job("job-123")
@@ -820,8 +820,8 @@ def sleeps(monkeypatch):
     monkeypatch.setattr(time, "sleep", recorded.append)
     monkeypatch.setattr(asyncio, "sleep", record)
     # tenacity keeps its own reference to the sleep function it was built with.
-    monkeypatch.setattr(PdfikClient._request.retry, "sleep", recorded.append)
-    monkeypatch.setattr(AsyncPdfikClient._request.retry, "sleep", record)
+    monkeypatch.setattr(PdfikClient._request_attempts.retry, "sleep", recorded.append)
+    monkeypatch.setattr(AsyncPdfikClient._request_attempts.retry, "sleep", record)
     return recorded
 
 
@@ -1023,11 +1023,12 @@ def test_busy_file_is_a_throttle_on_the_download_call_only(sleeps):
 
 @respx.mock
 def test_500_then_200_succeeds_with_the_exponential_backoff(sleeps):
-    route = respx.get("https://api.pdfik.net/jobs/job-123/download")
-    route.side_effect = [httpx.Response(500, text="Internal Server Error"), httpx.Response(200, content=b"%PDF-1.7 sample")]
+    # A status read, not a download: a download is one attempt (each stream counts).
+    route = respx.get("https://api.pdfik.net/jobs/job-123")
+    route.side_effect = [httpx.Response(500, text="Internal Server Error"), httpx.Response(200, json={"status": "done"})]
 
     client = PdfikClient(api_key="sk_test_123")
-    assert client.download_pdf("job-123") == b"%PDF-1.7 sample"
+    assert client.get_job("job-123").status == "done"
     assert sleeps == [1]
     assert route.call_count == 2
 
@@ -1240,11 +1241,12 @@ async def test_async_quota_429_on_create_is_raised_at_once(sleeps):
 @pytest.mark.asyncio
 @respx.mock
 async def test_async_500_then_200_succeeds_with_the_exponential_backoff(sleeps):
-    route = respx.get("https://api.pdfik.net/jobs/job-123/download")
-    route.side_effect = [httpx.Response(500, text="Internal Server Error"), httpx.Response(200, content=b"%PDF-1.7 sample")]
+    # A status read, not a download: a download is one attempt (each stream counts).
+    route = respx.get("https://api.pdfik.net/jobs/job-123")
+    route.side_effect = [httpx.Response(500, text="Internal Server Error"), httpx.Response(200, json={"status": "done"})]
 
     async with AsyncPdfikClient(api_key="sk_test_123") as client:
-        assert await client.download_pdf("job-123") == b"%PDF-1.7 sample"
+        assert (await client.get_job("job-123")).status == "done"
     assert sleeps == [1]
     assert route.call_count == 2
 
@@ -1725,7 +1727,7 @@ def test_connection_failure_is_a_network_error_resent_like_a_5xx(sleeps):
 
 
 @respx.mock
-def test_download_whose_body_breaks_off_is_a_network_error_resent_like_a_5xx(sleeps):
+def test_download_whose_body_breaks_off_is_a_network_error_and_not_resent(sleeps):
     route = respx.get(LOCAL_API + "/jobs/job-123/download").mock(side_effect=body_breaks_off)
 
     client = PdfikClient(api_key="sk_test_123", base_url=LOCAL_API)
@@ -1734,8 +1736,8 @@ def test_download_whose_body_breaks_off_is_a_network_error_resent_like_a_5xx(sle
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.error_code == "NETWORK_ERROR"
-    assert route.call_count == 3
-    assert sleeps == [1, 2]
+    assert route.call_count == 1
+    assert sleeps == []
 
 
 @respx.mock
@@ -1835,3 +1837,63 @@ async def test_async_header_value_httpx_refuses_to_send_is_raised_at_once_not_as
 
     assert route.call_count == 1
     assert sleeps == []
+
+
+# --- fixes of 2026-11-10 ---------------------------------------------------------------
+
+def test_an_empty_secret_never_verifies_a_delivery():
+    t_now = str(int(time.time()))
+    body = b'{"job_id":"j"}'
+    v1 = hmac.new(b"", t_now.encode() + b"." + body, hashlib.sha256).hexdigest()
+    headers = {"X-PDFik-Signature": "t=%s,v1=%s" % (t_now, v1), "X-PDFik-Timestamp": t_now}
+    assert PdfikClient.verify_webhook_signature(body, headers, "") is False
+
+
+def test_a_header_with_spaces_and_extra_tokens_still_verifies():
+    t_now = str(int(time.time()))
+    body = b'{"job_id":"j"}'
+    v1 = hmac.new(b"s", t_now.encode() + b"." + body, hashlib.sha256).hexdigest()
+    headers = {"X-PDFik-Signature": "t=%s, v0=old, junk, v1=%s" % (t_now, v1), "X-PDFik-Timestamp": t_now}
+    assert PdfikClient.verify_webhook_signature(body, headers, "s") is True
+
+
+def test_a_non_digit_timestamp_never_verifies():
+    body = b'{"job_id":"j"}'
+    odd = "1_794_340_000"
+    v1 = hmac.new(b"s", odd.encode() + b"." + body, hashlib.sha256).hexdigest()
+    headers = {"X-PDFik-Signature": "t=%s,v1=%s" % (odd, v1), "X-PDFik-Timestamp": odd}
+    assert PdfikClient.verify_webhook_signature(body, headers, "s") is False
+
+
+@pytest.mark.parametrize("key", ["sk_live_abc\n", " sk_live_abc", "sk_live_a\x00bc", "sk_live_é"])
+def test_an_api_key_http_cannot_send_is_refused_without_quoting_it(key):
+    with pytest.raises(ValueError) as exc:
+        PdfikClient(api_key=key)
+    assert "sk_live" not in str(exc.value)
+
+
+@respx.mock
+def test_the_volume_quota_held_by_running_jobs_is_waited_out(sleeps):
+    route = respx.post("https://api.pdfik.net/url-to-pdf")
+    route.side_effect = [
+        httpx.Response(429, json={"type": "https://docs.pdfik.net/error-codes#quota-bytes-exceeded",
+                                  "error": "BYTE_QUOTA_EXCEEDED", "reserved": 157286400, "retry_after_seconds": 5},
+                       headers={"Retry-After": "5"}),
+        httpx.Response(202, json={"job_id": "j2", "status": "queued", "detail": "queued"}),
+    ]
+    client = PdfikClient(api_key="sk_test_123")
+    assert client.url_to_pdf("https://example.com").job_id == "j2"
+    assert sleeps == [5]
+
+
+@respx.mock
+def test_throttle_waits_are_counted_across_5xx_resends(sleeps):
+    """One budget per call: before, every tenacity resend restarted it (up to 15 waits)."""
+    throttled = httpx.Response(429, json={"error": "RATE_LIMIT_EXCEEDED", "retry_after_seconds": 1})
+    route = respx.get("https://api.pdfik.net/jobs/job-123")
+    route.side_effect = [throttled] * 3 + [httpx.Response(500, text="x")] + [throttled] * 10
+    client = PdfikClient(api_key="sk_test_123")
+    with pytest.raises(PdfikError) as exc:
+        client.get_job("job-123")
+    assert exc.value.status_code == 429
+    assert route.call_count == 3 + 1 + 3
